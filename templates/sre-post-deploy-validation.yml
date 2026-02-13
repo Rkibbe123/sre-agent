@@ -1,0 +1,342 @@
+# =============================================================================
+# SRE Agent Post-Deployment Validation
+# =============================================================================
+# After deployment completes, runs SRE Agent diagnostics to verify the
+# deployment is healthy: checks service health, compares performance against
+# baselines, detects anomalies, and generates a deployment health report.
+#
+# Usage:
+#   - template: templates/sre-post-deploy-validation.yml
+#     parameters:
+#       azureServiceConnection: 'azure-devops-sp2'
+#       targetEnvironment: 'dev'
+#       targetResourceIds:
+#         - '/subscriptions/.../resourceGroups/.../providers/...'
+#       warmupSeconds: 120
+# =============================================================================
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'cicd-ai-agent'
+  - name: targetEnvironment
+    type: string
+    default: 'dev'
+  - name: targetResourceIds
+    type: object
+    default: []
+  - name: sreAgentResourceGroup
+    type: string
+    default: ''
+  - name: sreAgentName
+    type: string
+    default: ''
+  - name: warmupSeconds
+    type: number
+    default: 120
+  - name: healthCheckRetries
+    type: number
+    default: 3
+  - name: healthCheckIntervalSeconds
+    type: number
+    default: 30
+  - name: failOnUnhealthy
+    type: boolean
+    default: true
+  - name: metricsToCheck
+    type: string
+    default: 'Availability,SuccessE2ELatency,ServerErrors'
+  - name: enabled
+    type: boolean
+    default: true
+
+steps:
+  - ${{ if eq(parameters.enabled, true) }}:
+    # Wait for deployment to warm up
+    - script: |
+        echo "Waiting ${{ parameters.warmupSeconds }} seconds for deployment to warm up..."
+        sleep ${{ parameters.warmupSeconds }}
+        echo "Warmup complete. Starting post-deployment validation."
+      displayName: 'SRE Agent: Deployment Warmup (${{ parameters.warmupSeconds }}s)'
+
+    - task: AzureCLI@2
+      name: SREPostDeployValidation
+      displayName: 'SRE Agent: Post-Deploy Validation (${{ parameters.targetEnvironment }})'
+      inputs:
+        azureSubscription: '${{ parameters.azureServiceConnection }}'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   SRE AGENT: POST-DEPLOYMENT VALIDATION    " -ForegroundColor Cyan
+          Write-Host "   Environment: ${{ parameters.targetEnvironment }}" -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host ""
+
+          # Load SRE helpers
+          $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
+          if (Test-Path $helpersPath) { . $helpersPath }
+
+          $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
+          $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+          $subscriptionId = az account show --query id -o tsv
+
+          $validationResults = @{
+              environment = "${{ parameters.targetEnvironment }}"
+              buildId = "$(Build.BuildId)"
+              buildNumber = "$(Build.BuildNumber)"
+              timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+              resourceHealth = @()
+              metricsSnapshot = @()
+              anomalies = @()
+              overallStatus = "Healthy"
+              healthScore = 100
+          }
+
+          $targetResources = @()
+          $resourceIdsJson = '${{ convertToJson(parameters.targetResourceIds) }}'
+          if ($resourceIdsJson -and $resourceIdsJson -ne '[]') {
+            $targetResources = $resourceIdsJson | ConvertFrom-Json
+          }
+
+          # ──────────────────────────────────────────────
+          # PHASE 1: Resource Health Verification (with retries)
+          # ──────────────────────────────────────────────
+          Write-Host "PHASE 1: Resource Health Verification" -ForegroundColor Yellow
+
+          $maxRetries = ${{ parameters.healthCheckRetries }}
+          $retryInterval = ${{ parameters.healthCheckIntervalSeconds }}
+
+          foreach ($resourceId in $targetResources) {
+            Write-Host "  Checking: $resourceId"
+            $healthy = $false
+
+            for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+              $health = Get-AzureResourceHealth -ResourceId $resourceId -Token $mgmtToken
+
+              if ($health.status -eq "Available") {
+                $healthy = $true
+                Write-Host "    [Attempt $attempt] Healthy" -ForegroundColor Green
+                $validationResults.resourceHealth += @{
+                    resource = $resourceId
+                    status = "Available"
+                    attempts = $attempt
+                }
+                break
+              } else {
+                Write-Host "    [Attempt $attempt] Status: $($health.status) - retrying in ${retryInterval}s..." -ForegroundColor Yellow
+                if ($attempt -lt $maxRetries) { Start-Sleep -Seconds $retryInterval }
+              }
+            }
+
+            if (-not $healthy) {
+              $validationResults.resourceHealth += @{
+                  resource = $resourceId
+                  status = $health.status
+                  summary = $health.summary
+                  attempts = $maxRetries
+              }
+              $validationResults.anomalies += "Resource unhealthy after $maxRetries attempts: $resourceId ($($health.status))"
+              $validationResults.healthScore -= 25
+              Write-Host "    FAILED after $maxRetries attempts" -ForegroundColor Red
+            }
+          }
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # PHASE 2: Metrics Snapshot & Anomaly Detection
+          # ──────────────────────────────────────────────
+          Write-Host "PHASE 2: Metrics Snapshot & Anomaly Detection" -ForegroundColor Yellow
+
+          foreach ($resourceId in $targetResources) {
+            $metrics = Get-AzureMonitorMetrics `
+              -ResourceId $resourceId `
+              -Token $mgmtToken `
+              -MetricNames "${{ parameters.metricsToCheck }}" `
+              -Timespan "PT30M" `
+              -Interval "PT5M"
+
+            if ($metrics -and $metrics.value) {
+              foreach ($metric in $metrics.value) {
+                $metricName = $metric.name.value
+                $timeseries = $metric.timeseries
+                $latestValues = @()
+
+                foreach ($ts in $timeseries) {
+                  foreach ($dp in $ts.data | Select-Object -Last 6) {
+                    if ($dp.average -ne $null) { $latestValues += $dp.average }
+                    elseif ($dp.total -ne $null) { $latestValues += $dp.total }
+                  }
+                }
+
+                if ($latestValues.Count -gt 0) {
+                  $avg = ($latestValues | Measure-Object -Average).Average
+                  $max = ($latestValues | Measure-Object -Maximum).Maximum
+                  $min = ($latestValues | Measure-Object -Minimum).Minimum
+
+                  $validationResults.metricsSnapshot += @{
+                      resource = $resourceId
+                      metric = $metricName
+                      average = [math]::Round($avg, 4)
+                      max = [math]::Round($max, 4)
+                      min = [math]::Round($min, 4)
+                      datapoints = $latestValues.Count
+                  }
+
+                  Write-Host "  $metricName : avg=$([math]::Round($avg,2)), max=$([math]::Round($max,2)), min=$([math]::Round($min,2))"
+
+                  # Simple anomaly: error rates > 5% or latency > 2x baseline
+                  if ($metricName -match "Error|5xx|ServerErrors" -and $avg -gt 5) {
+                    $validationResults.anomalies += "High error rate: $metricName = $([math]::Round($avg,2))%"
+                    $validationResults.healthScore -= 20
+                  }
+                  if ($metricName -match "Latency" -and $avg -gt 5000) {
+                    $validationResults.anomalies += "High latency: $metricName = $([math]::Round($avg,2))ms"
+                    $validationResults.healthScore -= 15
+                  }
+                }
+              }
+            }
+          }
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # PHASE 3: Check for New Alerts Post-Deploy
+          # ──────────────────────────────────────────────
+          Write-Host "PHASE 3: Post-Deploy Alert Check" -ForegroundColor Yellow
+
+          $postDeployAlerts = Get-AzureMonitorAlerts -SubscriptionId $subscriptionId -Token $mgmtToken -Timespan "30m"
+          $newCritical = $postDeployAlerts | Where-Object { $_.properties.essentials.severity -in @("Sev0", "Sev1") }
+
+          if ($newCritical.Count -gt 0) {
+            $validationResults.anomalies += "New critical alerts fired post-deployment: $($newCritical.Count)"
+            $validationResults.healthScore -= (15 * $newCritical.Count)
+            Write-Host "  New critical alerts: $($newCritical.Count)" -ForegroundColor Red
+            foreach ($alert in $newCritical) {
+              Write-Host "    - $($alert.properties.essentials.alertRule)" -ForegroundColor Red
+            }
+          } else {
+            Write-Host "  No new critical alerts post-deployment" -ForegroundColor Green
+          }
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # PHASE 4: SRE Agent Deep Diagnostics
+          # ──────────────────────────────────────────────
+          Write-Host "PHASE 4: SRE Agent Diagnostics" -ForegroundColor Yellow
+
+          $contextData = $validationResults | ConvertTo-Json -Depth 10 -Compress
+          if ($contextData.Length -gt 12000) { $contextData = $contextData.Substring(0, 12000) }
+
+          $sreResult = Invoke-SREAgentAPI `
+            -Action "diagnostics" `
+            -TargetResourceId ($targetResources | Select-Object -First 1) `
+            -Context @"
+          POST-DEPLOYMENT VALIDATION for Build $(Build.BuildNumber) deployed to ${{ parameters.targetEnvironment }}.
+          Validate health and detect any deployment-caused regressions.
+
+          Collected validation data:
+          $contextData
+          "@ `
+            -Token $aiToken `
+            -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+            -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+            -SubscriptionId $subscriptionId `
+            -SREAgentName "${{ parameters.sreAgentName }}" `
+            -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+
+          if ($sreResult.success) {
+            Write-Host ""
+            Write-Host "--- SRE Agent Diagnostics ---" -ForegroundColor Cyan
+            Write-Host $sreResult.response
+            Write-Host "-----------------------------" -ForegroundColor Cyan
+
+            # Check if SRE Agent flagged critical issues
+            if ($sreResult.response -match "CRITICAL|UNHEALTHY|DEGRADED") {
+              $validationResults.anomalies += "SRE Agent flagged deployment issues"
+              $validationResults.healthScore -= 10
+            }
+          }
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # DECISION: Healthy / Degraded / Unhealthy
+          # ──────────────────────────────────────────────
+          $validationResults.healthScore = [Math]::Max(0, [Math]::Min(100, $validationResults.healthScore))
+
+          if ($validationResults.healthScore -ge 80) {
+            $validationResults.overallStatus = "Healthy"
+          } elseif ($validationResults.healthScore -ge 50) {
+            $validationResults.overallStatus = "Degraded"
+          } else {
+            $validationResults.overallStatus = "Unhealthy"
+          }
+
+          $statusColor = switch ($validationResults.overallStatus) {
+            "Healthy" { "Green" }
+            "Degraded" { "Yellow" }
+            "Unhealthy" { "Red" }
+          }
+
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   DEPLOYMENT STATUS: $($validationResults.overallStatus)" -ForegroundColor $statusColor
+          Write-Host "   Health Score: $($validationResults.healthScore)/100" -ForegroundColor Cyan
+          Write-Host "   Anomalies: $($validationResults.anomalies.Count)" -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+
+          if ($validationResults.anomalies.Count -gt 0) {
+            Write-Host ""
+            Write-Host "Anomalies Detected:" -ForegroundColor Yellow
+            foreach ($anomaly in $validationResults.anomalies) {
+              Write-Host "  - $anomaly" -ForegroundColor Yellow
+            }
+          }
+
+          # Set output variables for downstream (rollback, reporting)
+          Write-Host "##vso[task.setvariable variable=DeploymentHealthScore;isOutput=true]$($validationResults.healthScore)"
+          Write-Host "##vso[task.setvariable variable=DeploymentStatus;isOutput=true]$($validationResults.overallStatus)"
+          Write-Host "##vso[task.setvariable variable=AnomalyCount;isOutput=true]$($validationResults.anomalies.Count)"
+          Write-Host "##vso[task.setvariable variable=DeploymentHealthy;isOutput=true]$(if ($validationResults.overallStatus -eq 'Healthy') { 'true' } else { 'false' })"
+
+          # Generate validation report
+          $reportPath = "$(Build.ArtifactStagingDirectory)/sre-post-deploy-${{ parameters.targetEnvironment }}.md"
+          $reportContent = Format-SREReport `
+            -Title "Post-Deployment Validation - ${{ parameters.targetEnvironment }}" `
+            -Content @"
+          ## Status: $($validationResults.overallStatus) (Score: $($validationResults.healthScore)/100)
+
+          ### Resource Health
+          $(($validationResults.resourceHealth | ForEach-Object { "- $($_.resource): **$($_.status)** (checked $($_.attempts) times)" }) -join "`n")
+
+          ### Metrics Snapshot
+          $(($validationResults.metricsSnapshot | ForEach-Object { "- $($_.metric): avg=$($_.average), max=$($_.max), min=$($_.min)" }) -join "`n")
+
+          ### Anomalies
+          $(if ($validationResults.anomalies.Count -gt 0) { ($validationResults.anomalies | ForEach-Object { "- $_" }) -join "`n" } else { "None detected" })
+
+          ### SRE Agent Analysis
+          $($sreResult.response)
+          "@
+          $reportContent | Out-File -FilePath $reportPath -Encoding utf8
+
+          # Fail if unhealthy
+          if ($validationResults.overallStatus -eq "Unhealthy" -and "${{ parameters.failOnUnhealthy }}" -eq "true") {
+            Write-Host "##vso[task.logissue type=error]Post-deployment validation failed: $($validationResults.overallStatus) (score: $($validationResults.healthScore))"
+            Write-Host "##vso[task.complete result=Failed;]Deployment unhealthy - consider rollback"
+          } elseif ($validationResults.overallStatus -eq "Degraded") {
+            Write-Host "##vso[task.logissue type=warning]Deployment shows degraded performance - monitor closely"
+          }
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Post-Deploy Validation Report'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'SREPostDeployReport-${{ parameters.targetEnvironment }}'
+        publishLocation: 'Container'
+      continueOnError: true

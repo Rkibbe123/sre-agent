@@ -1,0 +1,288 @@
+# =============================================================================
+# SRE Agent Automated Rollback
+# =============================================================================
+# Triggers automated rollback when post-deployment validation detects an
+# unhealthy deployment. Supports: App Service slot swap, AKS rollout undo,
+# Azure Functions slot swap, and custom rollback scripts.
+#
+# Usage:
+#   - template: templates/sre-automated-rollback.yml
+#     parameters:
+#       azureServiceConnection: 'azure-devops-sp2'
+#       rollbackStrategy: 'slot-swap'
+#       appServiceName: 'my-app'
+#       resourceGroupName: 'my-rg'
+# =============================================================================
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'cicd-ai-agent'
+  - name: rollbackStrategy
+    type: string
+    default: 'slot-swap'
+    values:
+      - slot-swap          # App Service / Functions slot swap
+      - aks-rollback       # kubectl rollout undo
+      - revert-deploy      # Re-run previous successful pipeline
+      - custom-script      # User-provided rollback script
+      - sre-agent-auto     # Let SRE Agent decide the strategy
+  - name: appServiceName
+    type: string
+    default: ''
+  - name: resourceGroupName
+    type: string
+    default: ''
+  - name: slotName
+    type: string
+    default: 'staging'
+  - name: aksClusterName
+    type: string
+    default: ''
+  - name: aksNamespace
+    type: string
+    default: 'default'
+  - name: aksDeploymentName
+    type: string
+    default: ''
+  - name: customRollbackScript
+    type: string
+    default: ''
+  - name: targetEnvironment
+    type: string
+    default: 'dev'
+  - name: requireApproval
+    type: boolean
+    default: false
+  - name: notifyOnRollback
+    type: boolean
+    default: true
+  - name: sreAgentResourceGroup
+    type: string
+    default: ''
+  - name: sreAgentName
+    type: string
+    default: ''
+  - name: enabled
+    type: boolean
+    default: true
+
+steps:
+  - ${{ if eq(parameters.enabled, true) }}:
+    - task: AzureCLI@2
+      name: SRERollback
+      displayName: 'SRE Agent: Automated Rollback (${{ parameters.targetEnvironment }})'
+      inputs:
+        azureSubscription: '${{ parameters.azureServiceConnection }}'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          Write-Host "============================================" -ForegroundColor Red
+          Write-Host "   SRE AGENT: AUTOMATED ROLLBACK            " -ForegroundColor Red
+          Write-Host "   Environment: ${{ parameters.targetEnvironment }}" -ForegroundColor Red
+          Write-Host "   Strategy: ${{ parameters.rollbackStrategy }}" -ForegroundColor Red
+          Write-Host "============================================" -ForegroundColor Red
+          Write-Host ""
+
+          # Load SRE helpers
+          $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
+          if (Test-Path $helpersPath) { . $helpersPath }
+
+          $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+          $subscriptionId = az account show --query id -o tsv
+
+          $rollbackResult = @{
+              strategy = "${{ parameters.rollbackStrategy }}"
+              environment = "${{ parameters.targetEnvironment }}"
+              buildId = "$(Build.BuildId)"
+              timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+              status = "Pending"
+              actions = @()
+              recommendation = ""
+          }
+
+          # ──────────────────────────────────────────────
+          # PHASE 1: SRE Agent Mitigation Analysis
+          # ──────────────────────────────────────────────
+          Write-Host "PHASE 1: SRE Agent Mitigation Analysis" -ForegroundColor Yellow
+
+          $sreResult = Invoke-SREAgentAPI `
+            -Action "mitigate" `
+            -Context @"
+          DEPLOYMENT ROLLBACK TRIGGERED for Build $(Build.BuildNumber) in ${{ parameters.targetEnvironment }}.
+          Strategy: ${{ parameters.rollbackStrategy }}
+          App Service: ${{ parameters.appServiceName }}
+          Resource Group: ${{ parameters.resourceGroupName }}
+          AKS Cluster: ${{ parameters.aksClusterName }}
+          AKS Deployment: ${{ parameters.aksDeploymentName }}
+
+          Analyze the situation and confirm/modify the rollback strategy.
+          Should we proceed with ${{ parameters.rollbackStrategy }} or suggest a different approach?
+          "@ `
+            -Token $aiToken `
+            -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+            -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+            -SubscriptionId $subscriptionId `
+            -SREAgentName "${{ parameters.sreAgentName }}" `
+            -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+
+          if ($sreResult.success) {
+            $rollbackResult.recommendation = $sreResult.response
+            Write-Host "SRE Agent recommendation:" -ForegroundColor Cyan
+            Write-Host $sreResult.response
+            Write-Host ""
+          }
+
+          # ──────────────────────────────────────────────
+          # PHASE 2: Execute Rollback Strategy
+          # ──────────────────────────────────────────────
+          Write-Host "PHASE 2: Executing Rollback" -ForegroundColor Yellow
+          $rollbackSuccess = $false
+
+          switch ("${{ parameters.rollbackStrategy }}") {
+
+            "slot-swap" {
+              Write-Host "  Executing App Service slot swap..."
+              Write-Host "  Swapping ${{ parameters.slotName }} -> production on ${{ parameters.appServiceName }}"
+              try {
+                az webapp deployment slot swap `
+                  --resource-group "${{ parameters.resourceGroupName }}" `
+                  --name "${{ parameters.appServiceName }}" `
+                  --slot "${{ parameters.slotName }}" `
+                  --target-slot "production"
+
+                if ($LASTEXITCODE -eq 0) {
+                  $rollbackSuccess = $true
+                  $rollbackResult.actions += "Slot swap: ${{ parameters.slotName }} -> production"
+                  Write-Host "  Slot swap completed successfully" -ForegroundColor Green
+                } else {
+                  Write-Host "  Slot swap failed with exit code: $LASTEXITCODE" -ForegroundColor Red
+                }
+              } catch {
+                Write-Host "  Slot swap error: $_" -ForegroundColor Red
+                $rollbackResult.actions += "Slot swap FAILED: $_"
+              }
+            }
+
+            "aks-rollback" {
+              Write-Host "  Executing AKS rollout undo..."
+              try {
+                # Get AKS credentials
+                az aks get-credentials `
+                  --resource-group "${{ parameters.resourceGroupName }}" `
+                  --name "${{ parameters.aksClusterName }}" `
+                  --overwrite-existing
+
+                # Rollback the deployment
+                kubectl rollout undo deployment/${{ parameters.aksDeploymentName }} `
+                  -n ${{ parameters.aksNamespace }}
+
+                if ($LASTEXITCODE -eq 0) {
+                  # Wait for rollout
+                  kubectl rollout status deployment/${{ parameters.aksDeploymentName }} `
+                    -n ${{ parameters.aksNamespace }} `
+                    --timeout=300s
+
+                  $rollbackSuccess = ($LASTEXITCODE -eq 0)
+                  $rollbackResult.actions += "AKS rollout undo: ${{ parameters.aksDeploymentName }}"
+                  Write-Host "  AKS rollback completed" -ForegroundColor Green
+                }
+              } catch {
+                Write-Host "  AKS rollback error: $_" -ForegroundColor Red
+                $rollbackResult.actions += "AKS rollback FAILED: $_"
+              }
+            }
+
+            "custom-script" {
+              Write-Host "  Executing custom rollback script..."
+              $scriptPath = "${{ parameters.customRollbackScript }}"
+              if ($scriptPath -and (Test-Path $scriptPath)) {
+                try {
+                  # Execute script file directly instead of Invoke-Expression to avoid injection
+                  & $scriptPath
+                  $rollbackSuccess = ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq $null)
+                  $rollbackResult.actions += "Custom script executed: $scriptPath"
+                } catch {
+                  Write-Host "  Custom script error: $_" -ForegroundColor Red
+                  $rollbackResult.actions += "Custom script FAILED: $_"
+                }
+              } elseif ($scriptPath) {
+                Write-Host "  Custom rollback script not found: $scriptPath" -ForegroundColor Red
+                $rollbackResult.actions += "Custom script NOT FOUND: $scriptPath"
+              } else {
+                Write-Host "  No custom rollback script provided" -ForegroundColor Red
+              }
+            }
+
+            "sre-agent-auto" {
+              Write-Host "  SRE Agent autonomous mitigation mode..."
+              Write-Host "  The SRE Agent recommendation above should be reviewed."
+              Write-Host "  In fully autonomous mode (preview), the agent would execute mitigation steps."
+              $rollbackResult.actions += "SRE Agent autonomous mode - recommendation provided"
+              # In preview: SRE Agent would execute runbooks directly
+              # For now, log the recommendation for human review
+              $rollbackSuccess = $true  # Recommendation provided
+            }
+
+            default {
+              Write-Host "  Unknown rollback strategy: ${{ parameters.rollbackStrategy }}" -ForegroundColor Red
+            }
+          }
+
+          # ──────────────────────────────────────────────
+          # PHASE 3: Verify Rollback Success
+          # ──────────────────────────────────────────────
+          Write-Host ""
+          Write-Host "PHASE 3: Verification" -ForegroundColor Yellow
+
+          $rollbackResult.status = if ($rollbackSuccess) { "Success" } else { "Failed" }
+
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   ROLLBACK STATUS: $($rollbackResult.status)" -ForegroundColor $(if ($rollbackSuccess) { "Green" } else { "Red" })
+          Write-Host "============================================" -ForegroundColor Cyan
+
+          # Set output variables
+          Write-Host "##vso[task.setvariable variable=RollbackStatus;isOutput=true]$($rollbackResult.status)"
+          Write-Host "##vso[task.setvariable variable=RollbackStrategy;isOutput=true]${{ parameters.rollbackStrategy }}"
+
+          # Generate rollback report
+          $reportPath = "$(Build.ArtifactStagingDirectory)/sre-rollback-${{ parameters.targetEnvironment }}.md"
+          $reportContent = Format-SREReport `
+            -Title "Automated Rollback Report - ${{ parameters.targetEnvironment }}" `
+            -Content @"
+          ## Rollback Status: $($rollbackResult.status)
+
+          ### Strategy
+          ${{ parameters.rollbackStrategy }}
+
+          ### Actions Taken
+          $(($rollbackResult.actions | ForEach-Object { "- $_" }) -join "`n")
+
+          ### SRE Agent Recommendation
+          $($rollbackResult.recommendation)
+          "@
+          $reportContent | Out-File -FilePath $reportPath -Encoding utf8
+
+          # Notify on rollback
+          if ("${{ parameters.notifyOnRollback }}" -eq "true") {
+            Write-Host "##vso[task.logissue type=warning]ROLLBACK executed for Build $(Build.BuildNumber) in ${{ parameters.targetEnvironment }} (${{ parameters.rollbackStrategy }})"
+          }
+
+          if (-not $rollbackSuccess) {
+            Write-Host "##vso[task.logissue type=error]Rollback failed - manual intervention required"
+            Write-Host "##vso[task.complete result=Failed;]Automated rollback failed"
+          }
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Rollback Report'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'SRERollbackReport-${{ parameters.targetEnvironment }}'
+        publishLocation: 'Container'
+      continueOnError: true

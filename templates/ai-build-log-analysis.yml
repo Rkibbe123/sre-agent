@@ -1,0 +1,194 @@
+# Azure DevOps template for AI-powered build log analysis
+# Uses Azure OpenAI to analyze build logs for errors, warnings, and optimization opportunities
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+    default: 'azure-devops-sp2'
+  - name: azureOpenAIEndpoint
+    type: string
+    default: 'https://rkibbe-chat-demo-resource.services.ai.azure.com/api/projects/rkibbe-chat-demo/applications/azure-devops-ai-agent/protocols/openai/responses?api-version=2025-11-15-preview'
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'cicd-ai-agent'
+  - name: deploymentType
+    type: string
+    default: 'app-datafabric'
+
+steps:
+  - task: AzureCLI@2
+    name: AnalyzeBuildLogs
+    displayName: 'AI Analysis of Build Logs'
+    inputs:
+      azureSubscription: ${{ parameters.azureServiceConnection }}
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Write-Host "=== AI-Powered Build Log Analysis ===" -ForegroundColor Cyan
+        
+        # Azure DevOps REST API to fetch build logs
+        $orgUrl = "$(System.CollectionUri)"
+        $project = "$(System.TeamProject)"
+        $buildId = "$(Build.BuildId)"
+        
+        Write-Host "Fetching build logs for Build ID: $buildId"
+        
+        # Get PAT or use System.AccessToken
+        $token = "$(System.AccessToken)"
+        $headers = @{
+            "Authorization" = "Bearer $token"
+            "Content-Type" = "application/json"
+        }
+        
+        # Get build timeline (contains all tasks and their logs)
+        $timelineUrl = "${orgUrl}${project}/_apis/build/builds/${buildId}/timeline?api-version=7.1"
+        $timeline = Invoke-RestMethod -Uri $timelineUrl -Headers $headers -Method Get
+        
+        # Collect logs from failed or warning tasks
+        $logContent = @()
+        $logContent += "=== BUILD SUMMARY ==="
+        $logContent += "Build: $(Build.BuildNumber)"
+        $logContent += "Branch: $(Build.SourceBranch)"
+        $logContent += "Deployment Type: ${{ parameters.deploymentType }}"
+        $logContent += ""
+        
+        foreach ($record in $timeline.records | Where-Object { $_.type -eq "Task" }) {
+            $taskName = $record.name
+            $taskResult = $record.result
+            $taskState = $record.state
+            
+            $logContent += "--- Task: $taskName | Result: $taskResult ---"
+            
+            # Fetch actual log content for failed/warning tasks or all tasks
+            if ($record.log.url) {
+                try {
+                    $taskLog = Invoke-RestMethod -Uri $record.log.url -Headers $headers -Method Get
+                    # Truncate long logs to avoid token limits
+                    $logLines = $taskLog -split "`n" | Select-Object -Last 100
+                    $logContent += $logLines -join "`n"
+                } catch {
+                    $logContent += "(Could not fetch log)"
+                }
+            }
+            $logContent += ""
+        }
+        
+        # Combine and truncate to fit token limits (~15000 chars)
+        $combinedLogs = ($logContent -join "`n")
+        if ($combinedLogs.Length -gt 15000) {
+            $combinedLogs = $combinedLogs.Substring(0, 15000) + "`n... [truncated]"
+        }
+        
+        Write-Host "Collected $($combinedLogs.Length) characters of log data"
+        
+        $prompt = @"
+        You are a DevOps expert analyzing Azure DevOps build logs for a Databricks Asset Bundle deployment pipeline.
+        
+        **Analyze these build logs and provide:**
+        
+        1. **Error Analysis**
+           - Identify any errors or failures
+           - Root cause analysis
+           - Specific remediation steps
+        
+        2. **Warning Review**
+           - List all warnings found
+           - Assess severity and impact
+        
+        3. **Performance Issues**
+           - Long-running tasks
+           - Inefficient patterns
+        
+        4. **Best Practice Recommendations**
+           - Code improvements
+           - Pipeline optimization
+           - Security concerns
+        
+        5. **Error Handling Improvements**
+           - Missing try/catch blocks
+           - Insufficient logging
+           - Missing validation
+        
+        **Format:** Use 🔴 Critical, 🟡 Warning, 🟢 Info, 💡 Suggestion prefixes.
+        
+        **BUILD LOGS:**
+        $combinedLogs
+        "@
+        
+        # Get Azure AD token for Azure AI Services
+        $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+        
+        $body = @{
+            model = "${{ parameters.azureOpenAIDeployment }}"
+            input = $prompt
+        } | ConvertTo-Json -Depth 10
+        
+        $uri = "${{ parameters.azureOpenAIEndpoint }}"
+        
+        Write-Host "Sending logs to AI for analysis..."
+        
+        try {
+            $response = Invoke-RestMethod -Uri $uri `
+                -Method POST `
+                -Headers @{
+                    "Authorization" = "Bearer $aiToken"
+                    "Content-Type" = "application/json"
+                } `
+                -Body $body
+            
+            # Debug: Show response structure
+            Write-Host "Response received. Parsing..."
+            
+            # Handle different response formats from Azure AI Services
+            $analysis = $null
+            
+            # Format 1: Responses API format (output[].content[].text)
+            if ($response.output -and $response.output[0].content) {
+                $analysis = $response.output[0].content[0].text
+            }
+            # Format 2: Chat completions format (choices[].message.content)
+            elseif ($response.choices -and $response.choices[0].message) {
+                $analysis = $response.choices[0].message.content
+            }
+            # Format 3: Simple text response
+            elseif ($response.text) {
+                $analysis = $response.text
+            }
+            # Format 4: Direct content property
+            elseif ($response.content) {
+                $analysis = $response.content
+            }
+            # Format 5: Response might be a string
+            elseif ($response -is [string]) {
+                $analysis = $response
+            }
+            else {
+                # Debug: dump response structure to understand the format
+                Write-Host "##[debug]Response structure: $($response | ConvertTo-Json -Depth 5 -Compress)"
+                Write-Host "##vso[task.logissue type=warning]Unexpected response format from AI endpoint"
+                $analysis = "Unable to parse AI response. Raw response logged for debugging."
+            }
+            
+            if ($analysis) {
+                Write-Host ""
+                Write-Host "========================================" -ForegroundColor Cyan
+                Write-Host "       AI BUILD LOG ANALYSIS            " -ForegroundColor Cyan
+                Write-Host "========================================" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host $analysis
+                Write-Host ""
+                Write-Host "========================================" -ForegroundColor Cyan
+                
+                # Flag critical issues in pipeline
+                if ($analysis -match "🔴") {
+                    Write-Host "##vso[task.logissue type=error]Critical issues detected - review AI analysis above"
+                }
+                if ($analysis -match "🟡") {
+                    Write-Host "##vso[task.logissue type=warning]Warnings detected - review AI analysis above"
+                }
+            }
+            
+        } catch {
+            Write-Host "##vso[task.logissue type=warning]AI Analysis failed: $_"
+            Write-Host "Error details: $($_.Exception.Message)"
+        }

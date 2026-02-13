@@ -1,0 +1,198 @@
+# AI Test Generation Pipeline Template
+# This template generates tests for Databricks notebooks using Azure OpenAI
+
+parameters:
+  - name: notebooks_path
+    type: string
+    default: 'notebooks/code/datafabric'
+    displayName: 'Path to notebooks'
+  
+  - name: output_dir
+    type: string
+    default: 'generated_tests'
+    displayName: 'Output directory for generated tests'
+  
+  - name: run_generated_tests
+    type: boolean
+    default: true
+    displayName: 'Run generated tests after generation'
+  
+  - name: notebook_pattern
+    type: string
+    default: '**/*.ipynb'
+    displayName: 'Glob pattern for notebook discovery'
+  
+  - name: azure_openai_endpoint_secret
+    type: string
+    default: 'azure-openai-endpoint'
+    displayName: 'Key Vault secret name for Azure OpenAI endpoint'
+  
+  - name: azure_openai_key_secret
+    type: string
+    default: 'azure-openai-api-key'
+    displayName: 'Key Vault secret name for Azure OpenAI API key'
+
+stages:
+  - stage: AITestGeneration
+    displayName: 'AI-Powered Test Generation'
+    jobs:
+      - job: GenerateTests
+        displayName: 'Generate Tests from Notebooks'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - checkout: self
+            displayName: 'Checkout Repository'
+            clean: true
+
+          - task: UsePythonVersion@0
+            displayName: 'Use Python 3.10'
+            inputs:
+              versionSpec: '3.10'
+              addToPath: true
+
+          - script: |
+              pip install openai pytest pytest-cov pyspark
+            displayName: 'Install Python Dependencies'
+
+          # Option 1: Get secrets from Azure Key Vault
+          - task: AzureKeyVault@2
+            displayName: 'Get Azure OpenAI Secrets'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              KeyVaultName: '$(keyVaultName)'
+              SecretsFilter: '${{ parameters.azure_openai_endpoint_secret }},${{ parameters.azure_openai_key_secret }}'
+              RunAsPreJob: false
+
+          # Generate tests using AI
+          - script: |
+              echo "Starting AI Test Generation..."
+              echo "Notebooks Path: $(Build.SourcesDirectory)/${{ parameters.notebooks_path }}"
+              echo "Output Directory: $(Build.SourcesDirectory)/${{ parameters.output_dir }}"
+              
+              python $(Build.SourcesDirectory)/pipeline/scripts/ai_test_generator.py \
+                --notebooks-path "$(Build.SourcesDirectory)/${{ parameters.notebooks_path }}" \
+                --output-dir "$(Build.SourcesDirectory)/${{ parameters.output_dir }}" \
+                --pattern "${{ parameters.notebook_pattern }}"
+              
+              echo "Test generation complete!"
+              ls -la $(Build.SourcesDirectory)/${{ parameters.output_dir }}/
+            displayName: 'Generate Tests with Azure OpenAI'
+            env:
+              AZURE_OPENAI_ENDPOINT: $(${{ parameters.azure_openai_endpoint_secret }})
+              AZURE_OPENAI_API_KEY: $(${{ parameters.azure_openai_key_secret }})
+              AZURE_OPENAI_DEPLOYMENT: 'gpt-4'  # Or your deployment name
+
+          # Publish generated tests as artifact
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Generated Tests'
+            inputs:
+              PathtoPublish: '$(Build.SourcesDirectory)/${{ parameters.output_dir }}'
+              ArtifactName: 'AIGeneratedTests'
+              publishLocation: 'Container'
+
+      # Optional: Run the generated tests
+      - ${{ if eq(parameters.run_generated_tests, true) }}:
+        - job: RunGeneratedTests
+          displayName: 'Execute Generated Tests'
+          dependsOn: GenerateTests
+          pool:
+            vmImage: 'ubuntu-latest'
+          
+          steps:
+            - checkout: self
+
+            - task: UsePythonVersion@0
+              displayName: 'Use Python 3.10'
+              inputs:
+                versionSpec: '3.10'
+
+            - task: DownloadBuildArtifacts@1
+              displayName: 'Download Generated Tests'
+              inputs:
+                buildType: 'current'
+                downloadType: 'single'
+                artifactName: 'AIGeneratedTests'
+                downloadPath: '$(Build.SourcesDirectory)'
+
+            - script: |
+                pip install pytest pytest-cov pyspark unittest-xml-reporting
+              displayName: 'Install Test Dependencies'
+
+            - script: |
+                cd $(Build.SourcesDirectory)/AIGeneratedTests
+                
+                # Run tests with coverage
+                pytest . \
+                  --junitxml=test-results.xml \
+                  --cov=. \
+                  --cov-report=xml:coverage.xml \
+                  --cov-report=html:coverage_html \
+                  -v \
+                  || true  # Don't fail pipeline on test failures for generated tests
+                
+                echo "Test execution complete!"
+              displayName: 'Run Generated Pytest Tests'
+
+            - task: PublishTestResults@2
+              displayName: 'Publish Test Results'
+              inputs:
+                testResultsFormat: 'JUnit'
+                testResultsFiles: '**/test-results.xml'
+                searchFolder: '$(Build.SourcesDirectory)/AIGeneratedTests'
+                mergeTestResults: true
+                failTaskOnFailedTests: false  # Generated tests may need manual review
+                testRunTitle: 'AI Generated Tests'
+
+            - task: PublishCodeCoverageResults@1
+              displayName: 'Publish Code Coverage'
+              inputs:
+                codeCoverageTool: 'Cobertura'
+                summaryFileLocation: '$(Build.SourcesDirectory)/AIGeneratedTests/coverage.xml'
+                reportDirectory: '$(Build.SourcesDirectory)/AIGeneratedTests/coverage_html'
+
+  # Analysis stage - Review generated tests
+  - stage: TestQualityAnalysis
+    displayName: 'Analyze Generated Test Quality'
+    dependsOn: AITestGeneration
+    jobs:
+      - job: AnalyzeTestQuality
+        displayName: 'Quality Analysis'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'AIGeneratedTests'
+              downloadPath: '$(Build.SourcesDirectory)'
+
+          - script: |
+              echo "=== AI Generated Test Quality Report ==="
+              
+              cd $(Build.SourcesDirectory)/AIGeneratedTests
+              
+              # Count generated test files
+              TEST_COUNT=$(find . -name "test_*.py" | wc -l)
+              echo "Total test files generated: $TEST_COUNT"
+              
+              # Count test functions
+              FUNC_COUNT=$(grep -r "def test_" . --include="*.py" | wc -l)
+              echo "Total test functions: $FUNC_COUNT"
+              
+              # Check for common patterns
+              echo ""
+              echo "=== Test Pattern Analysis ==="
+              echo "Fixtures found: $(grep -r "@pytest.fixture" . --include="*.py" | wc -l)"
+              echo "Parametrized tests: $(grep -r "@pytest.mark.parametrize" . --include="*.py" | wc -l)"
+              echo "Mock usage: $(grep -r "mock\|Mock\|patch" . --include="*.py" | wc -l)"
+              
+              # List all generated test files
+              echo ""
+              echo "=== Generated Test Files ==="
+              find . -name "test_*.py" -exec basename {} \;
+              
+            displayName: 'Generate Quality Report'

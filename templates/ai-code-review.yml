@@ -1,0 +1,472 @@
+# AI-Powered Code Review Template
+# Scans entire repository for security vulnerabilities, best practices, and code quality
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'gpt-4'
+  - name: notebooks_path
+    type: string
+    default: 'notebooks'
+  - name: failOnCritical
+    type: boolean
+    default: false
+  - name: scanEntireRepo
+    type: boolean
+    default: true
+
+steps:
+  - checkout: self
+    displayName: 'Checkout Repository'
+    clean: true
+    fetchDepth: 0  # Full history for git diff
+
+  - task: UsePythonVersion@0
+    displayName: 'Setup Python'
+    inputs:
+      versionSpec: '3.10'
+      addToPath: true
+
+  - script: |
+      pip install bandit==1.8.3
+    displayName: 'Install Security Scanning Tools'
+
+  # Run security pattern scan first (entire repo)
+  - template: security-scan.yml
+    parameters:
+      failOnCritical: ${{ parameters.failOnCritical }}
+      scanPath: '$(Build.SourcesDirectory)'
+
+  - task: AzureCLI@2
+    name: AICodeReview
+    displayName: 'AI-Powered Code Review & Security Scan'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "   AI-POWERED CODE REVIEW & SECURITY SCAN   " -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host ""
+        
+        $repoPath = "$(Build.SourcesDirectory)"
+        $notebooksPath = "$repoPath/${{ parameters.notebooks_path }}"
+        
+        # ========================================
+        # PHASE 1: Collect All Repository Files
+        # ========================================
+        Write-Host "📁 PHASE 1: Collecting All Repository Files" -ForegroundColor Yellow
+        
+        # Scan entire repository, not just changed files
+        Write-Host "  Scanning entire repository for comprehensive coverage..."
+        
+        $allNotebooks = Get-ChildItem -Path $repoPath -Recurse -Filter "*.ipynb" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+        $allPythonFiles = Get-ChildItem -Path $repoPath -Recurse -Filter "*.py" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+        $allYamlFiles = Get-ChildItem -Path $repoPath -Recurse -Include "*.yml","*.yaml" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+        
+        # Convert to relative paths
+        $changedNotebooks = $allNotebooks | ForEach-Object { $_.Replace($repoPath + [IO.Path]::DirectorySeparatorChar, "").Replace("\", "/") }
+        $changedPython = $allPythonFiles | ForEach-Object { $_.Replace($repoPath + [IO.Path]::DirectorySeparatorChar, "").Replace("\", "/") }
+        $changedYaml = $allYamlFiles | ForEach-Object { $_.Replace($repoPath + [IO.Path]::DirectorySeparatorChar, "").Replace("\", "/") }
+        
+        # Combine all files for general reference
+        $changedFiles = @()
+        $changedFiles += $changedNotebooks
+        $changedFiles += $changedPython
+        $changedFiles += $changedYaml
+        
+        Write-Host "  Total notebooks: $($changedNotebooks.Count)"
+        Write-Host "  Total Python files: $($changedPython.Count)"
+        Write-Host "  Total YAML files: $($changedYaml.Count)"
+        Write-Host "  Total files to scan: $($changedFiles.Count)"
+        Write-Host ""
+        
+        # ========================================
+        # PHASE 2: Security Vulnerability Scan
+        # ========================================
+        Write-Host "🔒 PHASE 2: Security Vulnerability Scan" -ForegroundColor Yellow
+        
+        $securityFindings = @()
+        
+        # Run Bandit for Python security issues
+        Write-Host "  Running Bandit security scan..."
+        $banditOutput = ""
+        try {
+            # Scan full repo for consistency with security-scan.yml
+            $banditScanPath = if ("${{ parameters.scanEntireRepo }}" -eq "true") { $repoPath } else { $notebooksPath }
+            $banditOutput = bandit -r $banditScanPath -f json 2>$null | ConvertFrom-Json
+            if ($banditOutput.results) {
+                foreach ($finding in $banditOutput.results) {
+                    $securityFindings += @{
+                        tool = "Bandit"
+                        severity = $finding.issue_severity
+                        confidence = $finding.issue_confidence
+                        file = $finding.filename
+                        line = $finding.line_number
+                        issue = $finding.issue_text
+                        cwe = $finding.issue_cwe.id
+                    }
+                }
+            }
+        } catch {
+            Write-Host "  Bandit scan completed (no critical issues or tool not available)"
+        }
+        
+        # Check for hardcoded secrets patterns
+        Write-Host "  Scanning for hardcoded secrets..."
+        
+        # Define patterns separately to avoid YAML/PowerShell escaping issues
+        $secretPatterns = @()
+        
+        $p = @{ name = "API Key"; pattern = '(?i)(api[_-]?key|apikey)\s*[=:]\s*[''"][^''"]{10,}[''"]' }
+        $secretPatterns += $p
+        
+        $p = @{ name = "Password"; pattern = '(?i)(password|passwd|pwd)\s*[=:]\s*[''"][^''"]+[''"]' }
+        $secretPatterns += $p
+        
+        $p = @{ name = "Connection String"; pattern = '(?i)(connection[_-]?string|connstr)\s*[=:]\s*[''"][^''"]+[''"]' }
+        $secretPatterns += $p
+        
+        $p = @{ name = "Bearer Token"; pattern = '(?i)bearer\s+[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+' }
+        $secretPatterns += $p
+        
+        $p = @{ name = "AWS Key"; pattern = '(?i)(aws[_-]?access[_-]?key|aws[_-]?secret)\s*[=:]\s*[''"][^''"]+[''"]' }
+        $secretPatterns += $p
+        
+        $p = @{ name = "Azure Key"; pattern = '(?i)(azure[_-]?storage[_-]?key|account[_-]?key)\s*[=:]\s*[''"][A-Za-z0-9+/=]{20,}[''"]' }
+        $secretPatterns += $p
+        
+        $p = @{ name = "Private Key"; pattern = '-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----' }
+        $secretPatterns += $p
+        
+        $allFiles = Get-ChildItem -Path $repoPath -Recurse -Include "*.py","*.ipynb","*.yml","*.yaml","*.json" -ErrorAction SilentlyContinue
+        foreach ($file in $allFiles) {
+            $content = Get-Content -Path $file.FullName -Raw -ErrorAction SilentlyContinue
+            if ($content) {
+                foreach ($pattern in $secretPatterns) {
+                    if ($content -match $pattern.pattern) {
+                        $securityFindings += @{
+                            tool = "SecretScan"
+                            severity = "HIGH"
+                            confidence = "MEDIUM"
+                            file = $file.FullName.Replace($repoPath, "")
+                            line = "N/A"
+                            issue = "Potential $($pattern.name) found"
+                            cwe = "CWE-798"
+                        }
+                    }
+                }
+            }
+        }
+        
+        Write-Host "  Found $($securityFindings.Count) security findings"
+        Write-Host ""
+        
+        # ========================================
+        # PHASE 3: Best Practices Analysis
+        # ========================================
+        Write-Host "📋 PHASE 3: Best Practices Analysis" -ForegroundColor Yellow
+        
+        $bestPracticeIssues = @()
+        
+        # Analyze notebooks for common issues
+        $notebooks = Get-ChildItem -Path $notebooksPath -Filter "*.ipynb" -Recurse -ErrorAction SilentlyContinue
+        
+        foreach ($notebook in $notebooks) {
+            $content = Get-Content -Path $notebook.FullName -Raw -ErrorAction SilentlyContinue
+            if (-not $content) { continue }
+            
+            $relativePath = $notebook.FullName.Replace($repoPath, "")
+            
+            # Check for common anti-patterns
+            $checks = @()
+            
+            $c = @{ pattern = 'spark\.sql\s*\(\s*f[''"]'; issue = "SQL injection risk: f-string in spark.sql()"; severity = "HIGH" }
+            $checks += $c
+            
+            $c = @{ pattern = '\.collect\(\)'; issue = "Performance: .collect() brings all data to driver"; severity = "MEDIUM" }
+            $checks += $c
+            
+            $c = @{ pattern = 'import \*'; issue = "Code quality: Wildcard imports reduce readability"; severity = "LOW" }
+            $checks += $c
+            
+            $c = @{ pattern = 'except:\s*pass'; issue = "Error handling: Silent exception swallowing"; severity = "MEDIUM" }
+            $checks += $c
+            
+            $c = @{ pattern = 'print\('; issue = "Logging: Use proper logging instead of print()"; severity = "LOW" }
+            $checks += $c
+            
+            $c = @{ pattern = '\.toPandas\(\)'; issue = "Performance: toPandas() collects all data to driver"; severity = "MEDIUM" }
+            $checks += $c
+            
+            $c = @{ pattern = 'dbutils\.secrets\.get'; issue = "Info: Ensure secrets are from approved Key Vault"; severity = "INFO" }
+            $checks += $c
+            
+            $c = @{ pattern = 'spark\.conf\.set.*preview'; issue = "Stability: Using preview features"; severity = "LOW" }
+            $checks += $c
+            
+            $c = @{ pattern = 'while\s+True'; issue = "Code quality: Infinite loop detected"; severity = "MEDIUM" }
+            $checks += $c
+            
+            $c = @{ pattern = 'time\.sleep\(\d{2,}\)'; issue = "Performance: Long sleep detected"; severity = "LOW" }
+            $checks += $c
+            
+            foreach ($check in $checks) {
+                if ($content -match $check.pattern) {
+                    $bestPracticeIssues += @{
+                        file = $relativePath
+                        issue = $check.issue
+                        severity = $check.severity
+                    }
+                }
+            }
+            
+            # Check for missing docstrings in functions
+            $docstringPattern = 'def\s+(\w+)\s*\([^)]*\):\s*\n\s*(?!""")'
+            $funcMatches = [regex]::Matches($content, $docstringPattern)
+            foreach ($match in $funcMatches) {
+                if ($match.Groups.Count -gt 1) {
+                    $bestPracticeIssues += @{
+                        file = $relativePath
+                        issue = "Documentation: Function missing docstring"
+                        severity = "LOW"
+                    }
+                }
+            }
+        }
+        
+        Write-Host "  Found $($bestPracticeIssues.Count) best practice issues"
+        Write-Host ""
+        
+        # ========================================
+        # PHASE 4: AI Deep Analysis
+        # ========================================
+        Write-Host "🤖 PHASE 4: AI Deep Analysis" -ForegroundColor Yellow
+        
+        # Collect code samples for AI review
+        $codeForReview = @()
+        
+        # Add changed notebook content
+        foreach ($nb in $changedNotebooks) {
+            $nbPath = Join-Path $repoPath $nb
+            if (Test-Path $nbPath) {
+                $nbContent = Get-Content -Path $nbPath -Raw -ErrorAction SilentlyContinue
+                if ($nbContent.Length -gt 3000) {
+                    $nbContent = $nbContent.Substring(0, 3000) + "... [truncated]"
+                }
+                $codeForReview += "=== $nb ===`n$nbContent"
+            }
+        }
+        
+        # If no changes, sample some notebooks
+        if ($codeForReview.Count -eq 0) {
+            $sampleNotebooks = $notebooks | Select-Object -First 3
+            foreach ($nb in $sampleNotebooks) {
+                $nbContent = Get-Content -Path $nb.FullName -Raw -ErrorAction SilentlyContinue
+                if ($nbContent -and $nbContent.Length -gt 3000) {
+                    $nbContent = $nbContent.Substring(0, 3000) + "... [truncated]"
+                }
+                $relativePath = $nb.FullName.Replace($repoPath, "")
+                $codeForReview += "=== $relativePath ===`n$nbContent"
+            }
+        }
+        
+        $codeContext = ($codeForReview -join "`n`n") 
+        if ($codeContext.Length -gt 12000) {
+            $codeContext = $codeContext.Substring(0, 12000) + "`n... [truncated]"
+        }
+        
+        # Prepare findings summary
+        $findingsSummary = @"
+        SECURITY FINDINGS ($($securityFindings.Count)):
+        $(($securityFindings | ForEach-Object { "- [$($_.severity)] $($_.file): $($_.issue)" }) -join "`n")
+        
+        BEST PRACTICE ISSUES ($($bestPracticeIssues.Count)):
+        $(($bestPracticeIssues | Select-Object -First 20 | ForEach-Object { "- [$($_.severity)] $($_.file): $($_.issue)" }) -join "`n")
+        "@
+        
+        $prompt = @"
+        You are a senior code reviewer specializing in Databricks, PySpark, and data engineering. 
+        Perform a comprehensive code review focusing on:
+        
+        **1. SECURITY REVIEW**
+        - SQL injection vulnerabilities
+        - Credential exposure risks
+        - Insecure data handling
+        - Permission and access control issues
+        
+        **2. PERFORMANCE REVIEW**
+        - Spark optimization opportunities
+        - Memory management issues
+        - Inefficient transformations
+        - Partition strategies
+        
+        **3. CODE QUALITY**
+        - Error handling completeness
+        - Logging practices
+        - Code maintainability
+        - Documentation quality
+        
+        **4. DATABRICKS BEST PRACTICES**
+        - Widget usage patterns
+        - Notebook dependencies
+        - Cluster resource usage
+        - Delta Lake patterns
+        
+        **5. DATA QUALITY**
+        - Schema validation
+        - Null handling
+        - Data type consistency
+        
+        AUTOMATED SCAN FINDINGS:
+        $findingsSummary
+        
+        CODE TO REVIEW:
+        $codeContext
+        
+        Provide your analysis in this format:
+        
+        🔴 **CRITICAL** (must fix before merge):
+        - Issue and specific remediation
+        
+        🟡 **WARNING** (should address):
+        - Issue and recommendation
+        
+        🟢 **SUGGESTIONS** (nice to have):
+        - Improvement idea
+        
+        📊 **SUMMARY**:
+        - Overall code health score (1-10)
+        - Top 3 priorities
+        - Estimated technical debt
+        "@
+        
+        # Get Azure AD token
+        $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+        
+        $body = @{
+            model = "${{ parameters.azureOpenAIDeployment }}"
+            input = $prompt
+        } | ConvertTo-Json -Depth 10
+        
+        $uri = "${{ parameters.azureOpenAIEndpoint }}"
+        
+        try {
+            $response = Invoke-RestMethod -Uri $uri `
+                -Method POST `
+                -Headers @{
+                    "Authorization" = "Bearer $aiToken"
+                    "Content-Type" = "application/json"
+                } `
+                -Body $body
+            
+            # Parse response - handle different formats
+            $aiAnalysis = $null
+            if ($response.output -and $response.output[0].content) { $aiAnalysis = $response.output[0].content[0].text }
+            elseif ($response.choices -and $response.choices[0].message) { $aiAnalysis = $response.choices[0].message.content }
+            elseif ($response.text) { $aiAnalysis = $response.text }
+            elseif ($response.content) { $aiAnalysis = $response.content }
+            elseif ($response -is [string]) { $aiAnalysis = $response }
+            
+            if (-not $aiAnalysis) {
+                Write-Host "##[debug]Response structure: $($response | ConvertTo-Json -Depth 5 -Compress)"
+                throw "Unable to parse AI response"
+            }
+            
+            Write-Host ""
+            Write-Host "============================================" -ForegroundColor Cyan
+            Write-Host "         AI CODE REVIEW RESULTS             " -ForegroundColor Cyan
+            Write-Host "============================================" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host $aiAnalysis
+            Write-Host ""
+            Write-Host "============================================" -ForegroundColor Cyan
+            
+            # Set output variables
+            $criticalCount = ([regex]::Matches($aiAnalysis, "🔴")).Count
+            $warningCount = ([regex]::Matches($aiAnalysis, "🟡")).Count
+            
+            Write-Host "##vso[task.setvariable variable=CriticalIssues;isOutput=true]$criticalCount"
+            Write-Host "##vso[task.setvariable variable=WarningIssues;isOutput=true]$warningCount"
+            Write-Host "##vso[task.setvariable variable=SecurityFindings;isOutput=true]$($securityFindings.Count)"
+            
+            # Report issues to pipeline
+            if ($criticalCount -gt 0) {
+                Write-Host "##vso[task.logissue type=error]$criticalCount critical issues found - review required"
+                if ("${{ parameters.failOnCritical }}" -eq "true") {
+                    Write-Host "##vso[task.complete result=Failed;]Critical issues detected"
+                }
+            }
+            if ($warningCount -gt 0) {
+                Write-Host "##vso[task.logissue type=warning]$warningCount warnings found"
+            }
+            
+        } catch {
+            Write-Host "##vso[task.logissue type=warning]AI Analysis failed: $_"
+            Write-Host "Continuing with automated findings only..."
+            
+            # Still report automated findings
+            if ($securityFindings.Count -gt 0) {
+                Write-Host ""
+                Write-Host "=== SECURITY FINDINGS ===" -ForegroundColor Red
+                foreach ($finding in $securityFindings) {
+                    Write-Host "[$($finding.severity)] $($finding.file): $($finding.issue)"
+                }
+            }
+        }
+        
+        # ========================================
+        # PHASE 5: Generate Report Artifact
+        # ========================================
+        Write-Host ""
+        Write-Host "📄 PHASE 5: Generating Report" -ForegroundColor Yellow
+        
+        $reportPath = "$(Build.ArtifactStagingDirectory)/code-review-report.md"
+        
+        $report = @"
+        # AI Code Review Report
+        
+        **Build:** $(Build.BuildNumber)
+        **Branch:** $(Build.SourceBranch)
+        **Date:** $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        
+        ## Summary
+        
+        | Category | Count |
+        |----------|-------|
+        | Security Findings | $($securityFindings.Count) |
+        | Best Practice Issues | $($bestPracticeIssues.Count) |
+        | Changed Notebooks | $($changedNotebooks.Count) |
+        
+        ## Security Findings
+        
+        $(if ($securityFindings.Count -gt 0) {
+            ($securityFindings | ForEach-Object { "- **[$($_.severity)]** $($_.file): $($_.issue)" }) -join "`n"
+        } else { "No security issues found." })
+        
+        ## Best Practice Issues
+        
+        $(if ($bestPracticeIssues.Count -gt 0) {
+            ($bestPracticeIssues | Select-Object -First 30 | ForEach-Object { "- **[$($_.severity)]** $($_.file): $($_.issue)" }) -join "`n"
+        } else { "No best practice issues found." })
+        
+        ## AI Analysis
+        
+        $aiAnalysis
+        "@
+        
+        $report | Out-File -FilePath $reportPath -Encoding utf8
+        Write-Host "Report saved to: $reportPath"
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish Code Review Report'
+    inputs:
+      PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+      ArtifactName: 'CodeReviewReport'
+      publishLocation: 'Container'
+    condition: always()

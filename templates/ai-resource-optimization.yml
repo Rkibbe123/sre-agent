@@ -1,0 +1,470 @@
+# AI-Driven Resource Optimization Template
+# Analyzes Databricks workspace and recommends optimal configurations
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: databricksHost
+    type: string
+  - name: databricksToken
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'cicd-ai-agent'
+  - name: enabled
+    type: boolean
+    default: true
+
+steps:
+  - ${{ if eq(parameters.enabled, true) }}:
+    - task: AzureCLI@2
+      displayName: 'AI Resource Optimization Analysis'
+      inputs:
+        azureSubscription: '${{ parameters.azureServiceConnection }}'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   AI-DRIVEN RESOURCE OPTIMIZATION          " -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+          
+          $databricksHost = "${{ parameters.databricksHost }}"
+          $databricksToken = "${{ parameters.databricksToken }}"
+          
+          $headers = @{
+              "Authorization" = "Bearer $databricksToken"
+              "Content-Type" = "application/json"
+          }
+          
+          # ========================================
+          # PHASE 1: Collect Workspace Information
+          # ========================================
+          Write-Host ""
+          Write-Host "📊 PHASE 1: Collecting Workspace Data" -ForegroundColor Yellow
+          
+          $workspaceData = @{
+              clusters = @()
+              jobs = @()
+              recentRuns = @()
+              pools = @()
+              warehouses = @()
+              workspace_info = @{}
+          }
+          
+          # Get all clusters
+          Write-Host "  Fetching clusters..."
+          try {
+              $clustersResult = Invoke-RestMethod -Uri "$databricksHost/api/2.0/clusters/list" `
+                  -Method GET -Headers $headers
+              
+              foreach ($cluster in $clustersResult.clusters) {
+                  $workspaceData.clusters += @{
+                      name = $cluster.cluster_name
+                      id = $cluster.cluster_id
+                      state = $cluster.state
+                      node_type = $cluster.node_type_id
+                      driver_node_type = $cluster.driver_node_type_id
+                      num_workers = $cluster.num_workers
+                      autoscale = $cluster.autoscale
+                      spark_version = $cluster.spark_version
+                      autotermination_minutes = $cluster.autotermination_minutes
+                      cluster_source = $cluster.cluster_source
+                      creator = $cluster.creator_user_name
+                  }
+              }
+              Write-Host "    Found $($workspaceData.clusters.Count) clusters"
+          } catch {
+              Write-Host "    Could not fetch clusters: $_" -ForegroundColor Yellow
+          }
+          
+          # Get all jobs
+          Write-Host "  Fetching jobs..."
+          try {
+              $jobsResult = Invoke-RestMethod -Uri "$databricksHost/api/2.1/jobs/list?limit=100" `
+                  -Method GET -Headers $headers
+              
+              foreach ($job in $jobsResult.jobs) {
+                  $jobInfo = @{
+                      name = $job.settings.name
+                      job_id = $job.job_id
+                      created_time = $job.created_time
+                      creator = $job.creator_user_name
+                      schedule = $null
+                      cluster_spec = $null
+                      task_count = 0
+                  }
+                  
+                  if ($job.settings.schedule) {
+                      $jobInfo.schedule = $job.settings.schedule.quartz_cron_expression
+                  }
+                  
+                  if ($job.settings.tasks) {
+                      $jobInfo.task_count = $job.settings.tasks.Count
+                      # Get cluster config from first task
+                      $firstTask = $job.settings.tasks[0]
+                      if ($firstTask.new_cluster) {
+                          $jobInfo.cluster_spec = @{
+                              node_type = $firstTask.new_cluster.node_type_id
+                              num_workers = $firstTask.new_cluster.num_workers
+                              autoscale = $firstTask.new_cluster.autoscale
+                              spark_version = $firstTask.new_cluster.spark_version
+                          }
+                      } elseif ($firstTask.existing_cluster_id) {
+                          $jobInfo.cluster_spec = @{
+                              existing_cluster = $firstTask.existing_cluster_id
+                          }
+                      }
+                  }
+                  
+                  $workspaceData.jobs += $jobInfo
+              }
+              Write-Host "    Found $($workspaceData.jobs.Count) jobs"
+          } catch {
+              Write-Host "    Could not fetch jobs: $_" -ForegroundColor Yellow
+          }
+          
+          # Get recent job runs (last 50)
+          Write-Host "  Fetching recent job runs..."
+          try {
+              $runsResult = Invoke-RestMethod -Uri "$databricksHost/api/2.1/jobs/runs/list?limit=50&expand_tasks=false" `
+                  -Method GET -Headers $headers
+              
+              foreach ($run in $runsResult.runs) {
+                  $duration = 0
+                  if ($run.end_time -and $run.start_time) {
+                      $duration = ($run.end_time - $run.start_time) / 1000 / 60  # minutes
+                  }
+                  
+                  $workspaceData.recentRuns += @{
+                      job_id = $run.job_id
+                      run_id = $run.run_id
+                      state = $run.state.result_state
+                      life_cycle_state = $run.state.life_cycle_state
+                      duration_minutes = [math]::Round($duration, 2)
+                      start_time = $run.start_time
+                      cluster_spec = $run.cluster_spec
+                      trigger = $run.trigger
+                  }
+              }
+              Write-Host "    Found $($workspaceData.recentRuns.Count) recent runs"
+          } catch {
+              Write-Host "    Could not fetch runs: $_" -ForegroundColor Yellow
+          }
+          
+          # Get instance pools
+          Write-Host "  Fetching instance pools..."
+          try {
+              $poolsResult = Invoke-RestMethod -Uri "$databricksHost/api/2.0/instance-pools/list" `
+                  -Method GET -Headers $headers
+              
+              foreach ($pool in $poolsResult.instance_pools) {
+                  $workspaceData.pools += @{
+                      name = $pool.instance_pool_name
+                      id = $pool.instance_pool_id
+                      node_type = $pool.node_type_id
+                      min_idle = $pool.min_idle_instances
+                      max_capacity = $pool.max_capacity
+                      idle_instance_autotermination = $pool.idle_instance_autotermination_minutes
+                      state = $pool.state
+                  }
+              }
+              Write-Host "    Found $($workspaceData.pools.Count) instance pools"
+          } catch {
+              Write-Host "    Could not fetch pools: $_" -ForegroundColor Yellow
+          }
+          
+          # Get SQL warehouses
+          Write-Host "  Fetching SQL warehouses..."
+          try {
+              $warehousesResult = Invoke-RestMethod -Uri "$databricksHost/api/2.0/sql/warehouses" `
+                  -Method GET -Headers $headers
+              
+              foreach ($wh in $warehousesResult.warehouses) {
+                  $workspaceData.warehouses += @{
+                      name = $wh.name
+                      id = $wh.id
+                      cluster_size = $wh.cluster_size
+                      min_num_clusters = $wh.min_num_clusters
+                      max_num_clusters = $wh.max_num_clusters
+                      auto_stop_mins = $wh.auto_stop_mins
+                      state = $wh.state
+                      warehouse_type = $wh.warehouse_type
+                      spot_instance_policy = $wh.spot_instance_policy
+                  }
+              }
+              Write-Host "    Found $($workspaceData.warehouses.Count) SQL warehouses"
+          } catch {
+              Write-Host "    Could not fetch warehouses: $_" -ForegroundColor Yellow
+          }
+          
+          # Get cluster events for performance data
+          Write-Host "  Fetching cluster performance data..."
+          $clusterPerformance = @()
+          foreach ($cluster in $workspaceData.clusters | Select-Object -First 5) {
+              try {
+                  $eventsBody = @{
+                      cluster_id = $cluster.id
+                      limit = 20
+                  } | ConvertTo-Json
+                  
+                  $events = Invoke-RestMethod -Uri "$databricksHost/api/2.0/clusters/events" `
+                      -Method POST -Headers $headers -Body $eventsBody
+                  
+                  $clusterPerformance += @{
+                      cluster_name = $cluster.name
+                      event_count = $events.events.Count
+                      recent_events = ($events.events | Select-Object -First 5 | ForEach-Object { $_.type })
+                  }
+              } catch {
+                  # Ignore errors for individual clusters
+              }
+          }
+          
+          # ========================================
+          # PHASE 2: Calculate Metrics
+          # ========================================
+          Write-Host ""
+          Write-Host "📈 PHASE 2: Calculating Metrics" -ForegroundColor Yellow
+          
+          $metrics = @{
+              total_clusters = $workspaceData.clusters.Count
+              running_clusters = ($workspaceData.clusters | Where-Object { $_.state -eq "RUNNING" }).Count
+              terminated_clusters = ($workspaceData.clusters | Where-Object { $_.state -eq "TERMINATED" }).Count
+              total_jobs = $workspaceData.jobs.Count
+              scheduled_jobs = ($workspaceData.jobs | Where-Object { $_.schedule -ne $null }).Count
+              successful_runs = ($workspaceData.recentRuns | Where-Object { $_.state -eq "SUCCESS" }).Count
+              failed_runs = ($workspaceData.recentRuns | Where-Object { $_.state -eq "FAILED" }).Count
+              avg_run_duration = 0
+              total_pools = $workspaceData.pools.Count
+              total_warehouses = $workspaceData.warehouses.Count
+          }
+          
+          if ($workspaceData.recentRuns.Count -gt 0) {
+              $metrics.avg_run_duration = [math]::Round(
+                  ($workspaceData.recentRuns | Measure-Object -Property duration_minutes -Average).Average, 2
+              )
+          }
+          
+          # Calculate success rate
+          $totalRuns = $metrics.successful_runs + $metrics.failed_runs
+          $successRate = if ($totalRuns -gt 0) { [math]::Round(($metrics.successful_runs / $totalRuns) * 100, 1) } else { 0 }
+          $metrics.success_rate = "$successRate%"
+          
+          Write-Host "  Total clusters: $($metrics.total_clusters) (Running: $($metrics.running_clusters))"
+          Write-Host "  Total jobs: $($metrics.total_jobs) (Scheduled: $($metrics.scheduled_jobs))"
+          Write-Host "  Recent runs: Success=$($metrics.successful_runs), Failed=$($metrics.failed_runs)"
+          Write-Host "  Success rate: $($metrics.success_rate)"
+          Write-Host "  Avg run duration: $($metrics.avg_run_duration) minutes"
+          
+          # ========================================
+          # PHASE 3: AI Analysis & Recommendations
+          # ========================================
+          Write-Host ""
+          Write-Host "🤖 PHASE 3: AI Analysis & Recommendations" -ForegroundColor Yellow
+          
+          # Get Azure AD token for Azure OpenAI
+          $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+          
+          # Prepare data summary for AI
+          $clusterSummary = $workspaceData.clusters | ForEach-Object {
+              "- $($_.name): $($_.node_type), workers=$($_.num_workers), state=$($_.state), autotermination=$($_.autotermination_minutes)min"
+          }
+          
+          $jobSummary = $workspaceData.jobs | Select-Object -First 20 | ForEach-Object {
+              $schedule = if ($_.schedule) { "scheduled" } else { "manual" }
+              "- $($_.name): $schedule, tasks=$($_.task_count)"
+          }
+          
+          $runSummary = $workspaceData.recentRuns | Group-Object state | ForEach-Object {
+              "- $($_.Name): $($_.Count) runs"
+          }
+          
+          $poolSummary = $workspaceData.pools | ForEach-Object {
+              "- $($_.name): $($_.node_type), min=$($_.min_idle), max=$($_.max_capacity)"
+          }
+          
+          $warehouseSummary = $workspaceData.warehouses | ForEach-Object {
+              "- $($_.name): size=$($_.cluster_size), clusters=$($_.min_num_clusters)-$($_.max_num_clusters), auto_stop=$($_.auto_stop_mins)min"
+          }
+          
+          $prompt = @"
+          You are a Databricks optimization expert analyzing a workspace configuration.
+          Provide specific, actionable recommendations for cost optimization, performance improvement, and best practices.
+          
+          **WORKSPACE METRICS:**
+          - Total Clusters: $($metrics.total_clusters) (Running: $($metrics.running_clusters))
+          - Total Jobs: $($metrics.total_jobs) (Scheduled: $($metrics.scheduled_jobs))
+          - Instance Pools: $($metrics.total_pools)
+          - SQL Warehouses: $($metrics.total_warehouses)
+          - Job Success Rate: $($metrics.success_rate)
+          - Average Job Duration: $($metrics.avg_run_duration) minutes
+          
+          **CLUSTERS:**
+          $($clusterSummary -join "`n")
+          
+          **JOBS (Top 20):**
+          $($jobSummary -join "`n")
+          
+          **RECENT RUN RESULTS:**
+          $($runSummary -join "`n")
+          
+          **INSTANCE POOLS:**
+          $($poolSummary -join "`n")
+          
+          **SQL WAREHOUSES:**
+          $($warehouseSummary -join "`n")
+          
+          Provide analysis in this format:
+          
+          ## 💰 COST OPTIMIZATION
+          - List specific recommendations to reduce costs
+          - Identify idle or oversized resources
+          - Suggest spot instance opportunities
+          
+          ## ⚡ PERFORMANCE OPTIMIZATION
+          - Cluster sizing recommendations
+          - Autoscaling configurations
+          - Instance pool recommendations
+          
+          ## 🔧 CONFIGURATION RECOMMENDATIONS
+          - Autotermination settings
+          - Cluster policies to implement
+          - Job scheduling improvements
+          
+          ## 🎯 CLUSTER ASSIGNMENT RECOMMENDATIONS
+          For each major workload type, recommend:
+          - Optimal node type
+          - Worker count or autoscaling range
+          - Whether to use job clusters vs all-purpose
+          
+          ## ⚠️ ISSUES DETECTED
+          - Any misconfigurations
+          - Reliability concerns
+          - Security considerations
+          
+          ## 📊 RECOMMENDED CLUSTER CONFIGURATIONS
+          Provide specific cluster_id assignments:
+          \`\`\`
+          # For ETL workloads:
+          cluster_config_etl:
+            node_type_id: <recommended>
+            num_workers: <recommended>
+            autoscale: {min: X, max: Y}
+          
+          # For interactive/development:
+          cluster_config_dev:
+            node_type_id: <recommended>
+            num_workers: <recommended>
+            autotermination_minutes: <recommended>
+          
+          # For ML workloads:
+          cluster_config_ml:
+            node_type_id: <recommended>
+            num_workers: <recommended>
+          \`\`\`
+          
+          Use emojis: ✅ Good, ⚠️ Warning, ❌ Issue, 💡 Suggestion
+          Be specific with node types and numbers based on Azure/Databricks offerings.
+          "@
+          
+          $body = @{
+              model = "${{ parameters.azureOpenAIDeployment }}"
+              input = $prompt
+          } | ConvertTo-Json -Depth 10
+          
+          $uri = "${{ parameters.azureOpenAIEndpoint }}"
+          
+          Write-Host "  Analyzing workspace with AI..."
+          
+          try {
+              $response = Invoke-RestMethod -Uri $uri `
+                  -Method POST `
+                  -Headers @{
+                      "Authorization" = "Bearer $aiToken"
+                      "Content-Type" = "application/json"
+                  } `
+                  -Body $body
+              
+              # Parse response - handle different formats
+              $recommendations = $null
+              if ($response.output -and $response.output[0].content) { $recommendations = $response.output[0].content[0].text }
+              elseif ($response.choices -and $response.choices[0].message) { $recommendations = $response.choices[0].message.content }
+              elseif ($response.text) { $recommendations = $response.text }
+              elseif ($response.content) { $recommendations = $response.content }
+              elseif ($response -is [string]) { $recommendations = $response }
+              
+              if (-not $recommendations) {
+                  Write-Host "##[debug]Response structure: $($response | ConvertTo-Json -Depth 5 -Compress)"
+                  throw "Unable to parse AI response"
+              }
+              
+              Write-Host ""
+              Write-Host "============================================" -ForegroundColor Cyan
+              Write-Host "   AI RESOURCE OPTIMIZATION REPORT          " -ForegroundColor Cyan
+              Write-Host "============================================" -ForegroundColor Cyan
+              Write-Host ""
+              Write-Host $recommendations
+              Write-Host ""
+              Write-Host "============================================" -ForegroundColor Cyan
+              
+              # Set output variables for potential use
+              Write-Host "##vso[task.setvariable variable=aiRecommendations;isOutput=true]$($recommendations.Substring(0, [Math]::Min(1000, $recommendations.Length)))"
+              
+              # Flag issues
+              if ($recommendations -match "❌|CRITICAL|ISSUE") {
+                  Write-Host "##vso[task.logissue type=warning]Resource optimization issues detected - review recommendations above"
+              }
+              
+          } catch {
+              Write-Host "  AI analysis failed: $_" -ForegroundColor Red
+              Write-Host "  Error: $($_.Exception.Message)"
+          }
+          
+          # ========================================
+          # PHASE 4: Output Summary
+          # ========================================
+          Write-Host ""
+          Write-Host "📋 PHASE 4: Quick Recommendations" -ForegroundColor Yellow
+          
+          # Provide quick automated recommendations based on metrics
+          Write-Host ""
+          Write-Host "Automated Quick Checks:" -ForegroundColor Cyan
+          
+          # Check for clusters without autotermination
+          $noAutoterm = $workspaceData.clusters | Where-Object { 
+              $_.autotermination_minutes -eq 0 -or $_.autotermination_minutes -eq $null 
+          }
+          if ($noAutoterm.Count -gt 0) {
+              Write-Host "  ⚠️ $($noAutoterm.Count) cluster(s) without autotermination - potential cost risk"
+              Write-Host "##vso[task.logissue type=warning]$($noAutoterm.Count) clusters without autotermination"
+          }
+          
+          # Check for running clusters
+          if ($metrics.running_clusters -gt 2) {
+              Write-Host "  ⚠️ $($metrics.running_clusters) clusters currently running - verify if needed"
+          }
+          
+          # Check job failure rate
+          if ($totalRuns -gt 0 -and $metrics.failed_runs / $totalRuns -gt 0.2) {
+              Write-Host "  ❌ High job failure rate ($([math]::Round($metrics.failed_runs / $totalRuns * 100, 1))%) - investigate failures"
+              Write-Host "##vso[task.logissue type=warning]High job failure rate detected"
+          }
+          
+          # Check for instance pools usage
+          if ($metrics.total_pools -eq 0 -and $metrics.total_clusters -gt 3) {
+              Write-Host "  💡 Consider using Instance Pools to reduce cluster start times and costs"
+          }
+          
+          # Check SQL warehouse auto-stop
+          $noAutoStop = $workspaceData.warehouses | Where-Object { $_.auto_stop_mins -eq 0 }
+          if ($noAutoStop.Count -gt 0) {
+              Write-Host "  ⚠️ $($noAutoStop.Count) SQL warehouse(s) without auto-stop - potential cost risk"
+          }
+          
+          Write-Host ""
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   OPTIMIZATION ANALYSIS COMPLETE           " -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+      continueOnError: true

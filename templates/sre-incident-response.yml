@@ -1,0 +1,372 @@
+# =============================================================================
+# SRE Agent Incident Response Automation
+# =============================================================================
+# Automated incident detection, triage, and response. When pipeline failures
+# or deployment issues occur, this template:
+#   - Creates work items / GitHub issues
+#   - Triggers notification to Teams/Slack/PagerDuty
+#   - Runs SRE Agent root cause analysis
+#   - Executes automated runbook responses
+#   - Logs incident timeline for post-mortem
+#
+# Usage:
+#   - template: templates/sre-incident-response.yml
+#     parameters:
+#       azureServiceConnection: 'azure-devops-sp2'
+#       incidentSeverity: 'sev2'
+#       createWorkItem: true
+#       notifyTeams: true
+# =============================================================================
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'cicd-ai-agent'
+  - name: incidentSeverity
+    type: string
+    default: 'sev2'
+    values:
+      - sev1
+      - sev2
+      - sev3
+      - sev4
+  - name: incidentTitle
+    type: string
+    default: ''
+  - name: incidentContext
+    type: string
+    default: ''
+  - name: createWorkItem
+    type: boolean
+    default: true
+  - name: workItemType
+    type: string
+    default: 'Bug'
+  - name: notifyTeams
+    type: boolean
+    default: true
+  - name: teamsWebhookUrl
+    type: string
+    default: ''
+  - name: notifyPagerDuty
+    type: boolean
+    default: false
+  - name: pagerDutyIntegrationKey
+    type: string
+    default: ''
+  - name: runAutomatedRemediation
+    type: boolean
+    default: false
+  - name: sreAgentResourceGroup
+    type: string
+    default: ''
+  - name: sreAgentName
+    type: string
+    default: ''
+  - name: targetResourceIds
+    type: object
+    default: []
+  - name: enabled
+    type: boolean
+    default: true
+
+steps:
+  - ${{ if eq(parameters.enabled, true) }}:
+    - task: AzureCLI@2
+      name: SREIncidentResponse
+      displayName: 'SRE Agent: Incident Response (${{ parameters.incidentSeverity }})'
+      condition: always()  # Run even if previous steps failed
+      inputs:
+        azureSubscription: '${{ parameters.azureServiceConnection }}'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          Write-Host "============================================" -ForegroundColor Red
+          Write-Host "   SRE AGENT: INCIDENT RESPONSE             " -ForegroundColor Red
+          Write-Host "   Severity: ${{ parameters.incidentSeverity }}" -ForegroundColor Red
+          Write-Host "============================================" -ForegroundColor Red
+          Write-Host ""
+
+          # Load SRE helpers
+          $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
+          if (Test-Path $helpersPath) { . $helpersPath }
+
+          $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+          $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
+          $subscriptionId = az account show --query id -o tsv
+
+          $incidentId = "INC-$(Build.BuildId)-$(Get-Date -Format 'yyyyMMddHHmmss')"
+          $incidentTitle = "${{ parameters.incidentTitle }}"
+          if (-not $incidentTitle) {
+            $incidentTitle = "Pipeline Incident: Build $(Build.BuildNumber) - ${{ parameters.incidentSeverity }}"
+          }
+
+          $incident = @{
+              id = $incidentId
+              title = $incidentTitle
+              severity = "${{ parameters.incidentSeverity }}"
+              status = "Investigating"
+              buildId = "$(Build.BuildId)"
+              buildNumber = "$(Build.BuildNumber)"
+              branch = "$(Build.SourceBranch)"
+              pipeline = "$(Build.DefinitionName)"
+              requestedBy = "$(Build.RequestedFor)"
+              timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+              timeline = @()
+              rootCause = ""
+              remediation = @()
+          }
+
+          $incident.timeline += @{ time = (Get-Date -Format "HH:mm:ss"); event = "Incident created: $incidentTitle" }
+
+          # ──────────────────────────────────────────────
+          # PHASE 1: SRE Agent Root Cause Analysis
+          # ──────────────────────────────────────────────
+          Write-Host "PHASE 1: Root Cause Analysis" -ForegroundColor Yellow
+
+          $contextData = "${{ parameters.incidentContext }}"
+          if (-not $contextData) {
+            $contextData = @"
+          Build $(Build.BuildNumber) on branch $(Build.SourceBranch) triggered incident.
+          Pipeline: $(Build.DefinitionName)
+          Requested by: $(Build.RequestedFor)
+          Build reason: $(Build.Reason)
+          "@
+          }
+
+          $sreResult = Invoke-SREAgentAPI `
+            -Action "diagnostics" `
+            -Context @"
+          INCIDENT: $incidentTitle
+          SEVERITY: ${{ parameters.incidentSeverity }}
+
+          $contextData
+
+          Perform root cause analysis and recommend immediate remediation steps.
+          "@ `
+            -Token $aiToken `
+            -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+            -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+            -SubscriptionId $subscriptionId `
+            -SREAgentName "${{ parameters.sreAgentName }}" `
+            -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+
+          if ($sreResult.success) {
+            $incident.rootCause = $sreResult.response
+            Write-Host "SRE Agent root cause analysis:" -ForegroundColor Cyan
+            Write-Host $sreResult.response
+            $incident.timeline += @{ time = (Get-Date -Format "HH:mm:ss"); event = "Root cause analysis completed" }
+          }
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # PHASE 2: Create Azure DevOps Work Item
+          # ──────────────────────────────────────────────
+          if ("${{ parameters.createWorkItem }}" -eq "true") {
+            Write-Host "PHASE 2: Creating Work Item" -ForegroundColor Yellow
+
+            $pat = "$(System.AccessToken)"
+            $orgUrl = "$(System.CollectionUri)"
+            $project = "$(System.TeamProject)"
+
+            $workItemBody = @(
+              @{
+                op = "add"
+                path = "/fields/System.Title"
+                value = "[${{ parameters.incidentSeverity }}] $incidentTitle"
+              },
+              @{
+                op = "add"
+                path = "/fields/System.Description"
+                value = @"
+          <h2>Incident: $incidentId</h2>
+          <p><b>Severity:</b> ${{ parameters.incidentSeverity }}</p>
+          <p><b>Build:</b> <a href='$(Build.BuildUri)'>$(Build.BuildNumber)</a></p>
+          <p><b>Branch:</b> $(Build.SourceBranch)</p>
+          <p><b>Pipeline:</b> $(Build.DefinitionName)</p>
+          <p><b>Requested By:</b> $(Build.RequestedFor)</p>
+          <h3>Root Cause Analysis (SRE Agent)</h3>
+          <pre>$($incident.rootCause)</pre>
+          "@
+              },
+              @{
+                op = "add"
+                path = "/fields/Microsoft.VSTS.Common.Severity"
+                value = switch ("${{ parameters.incidentSeverity }}") {
+                  "sev1" { "1 - Critical" }
+                  "sev2" { "2 - High" }
+                  "sev3" { "3 - Medium" }
+                  "sev4" { "4 - Low" }
+                }
+              },
+              @{
+                op = "add"
+                path = "/fields/System.Tags"
+                value = "SRE-Agent;Incident;Auto-Created;${{ parameters.incidentSeverity }}"
+              }
+            ) | ConvertTo-Json -Depth 5
+
+            try {
+              $wiUrl = "${orgUrl}${project}/_apis/wit/workitems/`$${{ parameters.workItemType }}?api-version=7.1"
+              $wiResult = Invoke-RestMethod -Uri $wiUrl `
+                -Method POST `
+                -Headers @{
+                  "Authorization" = "Bearer $pat"
+                  "Content-Type" = "application/json-patch+json"
+                } `
+                -Body $workItemBody
+
+              $workItemId = $wiResult.id
+              Write-Host "  Created work item: #$workItemId" -ForegroundColor Green
+              Write-Host "##vso[task.setvariable variable=IncidentWorkItemId;isOutput=true]$workItemId"
+              $incident.timeline += @{ time = (Get-Date -Format "HH:mm:ss"); event = "Work item #$workItemId created" }
+            } catch {
+              Write-Host "  Failed to create work item: $_" -ForegroundColor Yellow
+            }
+            Write-Host ""
+          }
+
+          # ──────────────────────────────────────────────
+          # PHASE 3: Send Notifications
+          # ──────────────────────────────────────────────
+          Write-Host "PHASE 3: Notifications" -ForegroundColor Yellow
+
+          # Microsoft Teams notification via webhook
+          if ("${{ parameters.notifyTeams }}" -eq "true" -and "${{ parameters.teamsWebhookUrl }}") {
+            try {
+              $sevEmoji = switch ("${{ parameters.incidentSeverity }}") {
+                "sev1" { "🔴" }
+                "sev2" { "🟠" }
+                "sev3" { "🟡" }
+                "sev4" { "🔵" }
+              }
+
+              $teamsPayload = @{
+                type = "message"
+                attachments = @(@{
+                  contentType = "application/vnd.microsoft.card.adaptive"
+                  content = @{
+                    '$schema' = "http://adaptivecards.io/schemas/adaptive-card.json"
+                    type = "AdaptiveCard"
+                    version = "1.4"
+                    body = @(
+                      @{ type = "TextBlock"; text = "$sevEmoji SRE Agent Incident: ${{ parameters.incidentSeverity }}"; weight = "Bolder"; size = "Large" },
+                      @{ type = "TextBlock"; text = $incidentTitle; wrap = $true },
+                      @{ type = "FactSet"; facts = @(
+                        @{ title = "Build"; value = "$(Build.BuildNumber)" },
+                        @{ title = "Branch"; value = "$(Build.SourceBranch)" },
+                        @{ title = "Pipeline"; value = "$(Build.DefinitionName)" },
+                        @{ title = "Triggered By"; value = "$(Build.RequestedFor)" }
+                      )}
+                    )
+                  }
+                })
+              } | ConvertTo-Json -Depth 10
+
+              Invoke-RestMethod -Uri "${{ parameters.teamsWebhookUrl }}" -Method POST -Body $teamsPayload -ContentType "application/json"
+              Write-Host "  Teams notification sent" -ForegroundColor Green
+              $incident.timeline += @{ time = (Get-Date -Format "HH:mm:ss"); event = "Teams notification sent" }
+            } catch {
+              Write-Host "  Teams notification failed: $_" -ForegroundColor Yellow
+            }
+          }
+
+          # PagerDuty notification
+          if ("${{ parameters.notifyPagerDuty }}" -eq "true" -and "${{ parameters.pagerDutyIntegrationKey }}") {
+            try {
+              $pdPayload = @{
+                routing_key = "${{ parameters.pagerDutyIntegrationKey }}"
+                event_action = "trigger"
+                payload = @{
+                  summary = "$incidentTitle"
+                  severity = switch ("${{ parameters.incidentSeverity }}") {
+                    "sev1" { "critical" }
+                    "sev2" { "error" }
+                    "sev3" { "warning" }
+                    "sev4" { "info" }
+                  }
+                  source = "Azure DevOps Pipeline - $(Build.DefinitionName)"
+                  component = "$(Build.Repository.Name)"
+                  custom_details = @{
+                    buildId = "$(Build.BuildId)"
+                    branch = "$(Build.SourceBranch)"
+                    rootCause = if ($incident.rootCause) { $incident.rootCause.Substring(0, [Math]::Min(500, $incident.rootCause.Length)) } else { "Root cause analysis pending" }
+                  }
+                }
+                dedup_key = $incidentId
+              } | ConvertTo-Json -Depth 5
+
+              Invoke-RestMethod -Uri "https://events.pagerduty.com/v2/enqueue" -Method POST -Body $pdPayload -ContentType "application/json"
+              Write-Host "  PagerDuty alert triggered" -ForegroundColor Green
+              $incident.timeline += @{ time = (Get-Date -Format "HH:mm:ss"); event = "PagerDuty alert triggered" }
+            } catch {
+              Write-Host "  PagerDuty notification failed: $_" -ForegroundColor Yellow
+            }
+          }
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # PHASE 4: Automated Remediation (if enabled)
+          # ──────────────────────────────────────────────
+          if ("${{ parameters.runAutomatedRemediation }}" -eq "true") {
+            Write-Host "PHASE 4: Automated Remediation" -ForegroundColor Yellow
+            Write-Host "  SRE Agent autonomous remediation is in preview."
+            Write-Host "  Remediation recommendations from root cause analysis above should be reviewed."
+            $incident.timeline += @{ time = (Get-Date -Format "HH:mm:ss"); event = "Automated remediation requested (review SRE Agent recommendations)" }
+          }
+
+          # ──────────────────────────────────────────────
+          # Generate Incident Report
+          # ──────────────────────────────────────────────
+          $incident.status = "Triaged"
+          $incident.timeline += @{ time = (Get-Date -Format "HH:mm:ss"); event = "Incident triaged and assigned" }
+
+          Write-Host ""
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   INCIDENT RESPONSE COMPLETE               " -ForegroundColor Cyan
+          Write-Host "   ID: $incidentId" -ForegroundColor Cyan
+          Write-Host "   Status: $($incident.status)" -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+
+          # Set output variables
+          Write-Host "##vso[task.setvariable variable=IncidentId;isOutput=true]$incidentId"
+          Write-Host "##vso[task.setvariable variable=IncidentStatus;isOutput=true]$($incident.status)"
+          Write-Host "##vso[task.setvariable variable=IncidentSeverity;isOutput=true]${{ parameters.incidentSeverity }}"
+
+          # Generate report artifact
+          $reportPath = "$(Build.ArtifactStagingDirectory)/sre-incident-$incidentId.md"
+          $reportContent = Format-SREReport `
+            -Title "Incident Report: $incidentId" `
+            -Content @"
+          ## Incident: $incidentTitle
+
+          | Field | Value |
+          |-------|-------|
+          | ID | $incidentId |
+          | Severity | ${{ parameters.incidentSeverity }} |
+          | Status | $($incident.status) |
+
+          ### Timeline
+          $(($incident.timeline | ForEach-Object { "- **$($_.time)** $($_.event)" }) -join "`n")
+
+          ### Root Cause Analysis
+          $($incident.rootCause)
+
+          ### Remediation
+          $(if ($incident.remediation.Count -gt 0) { ($incident.remediation | ForEach-Object { "- $_" }) -join "`n" } else { "See SRE Agent recommendations above" })
+          "@
+          $reportContent | Out-File -FilePath $reportPath -Encoding utf8
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Incident Report'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'SREIncidentReport'
+        publishLocation: 'Container'
+      continueOnError: true

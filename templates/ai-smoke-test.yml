@@ -1,0 +1,43 @@
+# AI-Validated Smoke Test Template
+# Dynamically creates smoke test notebooks, executes them, and analyzes results with AI
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: databricksHost
+    type: string
+  - name: databricksToken
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'cicd-ai-agent'
+  - name: notebooks_path
+    type: string
+    default: 'notebooks/code/datafabric'
+  - name: target
+    type: string
+    default: 'dev'
+  - name: enabled
+    type: boolean
+    default: true
+
+steps:
+  - ${{ if eq(parameters.enabled, true) }}:
+    - task: AzureCLI@2
+      displayName: 'AI-Validated Smoke Test'
+      inputs:
+        azureSubscription: '${{ parameters.azureServiceConnection }}'
+        scriptType: pscore
+        scriptLocation: scriptPath
+        scriptPath: '$(Build.SourcesDirectory)/pipeline/scripts/ai-smoke-test.ps1'
+        arguments: >
+          -databricksHost "${{ parameters.databricksHost }}"
+          -databricksToken "${{ parameters.databricksToken }}"
+          -azureOpenAIEndpoint "${{ parameters.azureOpenAIEndpoint }}"
+          -azureOpenAIDeployment "${{ parameters.azureOpenAIDeployment }}"
+          -notebooksPath "${{ parameters.notebooks_path }}"
+          -target "${{ parameters.target }}"
+          -repoPath "$(Build.SourcesDirectory)"
+      continueOnError: true

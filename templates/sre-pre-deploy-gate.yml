@@ -1,0 +1,294 @@
+# =============================================================================
+# SRE Agent Pre-Deployment Readiness Gate
+# =============================================================================
+# Validates environment health BEFORE deploying. Blocks deployment if the
+# target environment is unhealthy, has active incidents, or shows risk factors.
+#
+# Uses: Azure Resource Health, Azure Monitor alerts, Activity Log, SRE Agent
+#       diagnostics to make a GO/NO-GO decision.
+#
+# Usage:
+#   - template: templates/sre-pre-deploy-gate.yml
+#     parameters:
+#       azureServiceConnection: 'azure-devops-sp2'
+#       targetEnvironment: 'dev'
+#       targetResourceIds:
+#         - '/subscriptions/.../resourceGroups/.../providers/...'
+#       blockOnNoGo: true
+# =============================================================================
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'cicd-ai-agent'
+  - name: targetEnvironment
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - qa
+      - staging
+      - prod
+  - name: targetResourceIds
+    type: object
+    default: []
+  - name: sreAgentResourceGroup
+    type: string
+    default: ''
+  - name: sreAgentName
+    type: string
+    default: ''
+  - name: blockOnNoGo
+    type: boolean
+    default: true
+  - name: minimumReadinessScore
+    type: number
+    default: 70
+  - name: checkActiveAlerts
+    type: boolean
+    default: true
+  - name: checkRecentDeployments
+    type: boolean
+    default: true
+  - name: enabled
+    type: boolean
+    default: true
+
+steps:
+  - ${{ if eq(parameters.enabled, true) }}:
+    - task: AzureCLI@2
+      name: SREPreDeployGate
+      displayName: 'SRE Agent: Pre-Deploy Readiness Gate (${{ parameters.targetEnvironment }})'
+      inputs:
+        azureSubscription: '${{ parameters.azureServiceConnection }}'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   SRE AGENT: PRE-DEPLOYMENT READINESS      " -ForegroundColor Cyan
+          Write-Host "   Environment: ${{ parameters.targetEnvironment }}" -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host ""
+
+          # Load SRE helpers
+          $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
+          if (Test-Path $helpersPath) {
+            . $helpersPath
+          } else {
+            Write-Host "##vso[task.logissue type=warning]SRE helpers not found - ensure sre-agent-common.yml runs first"
+          }
+
+          $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
+          $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+          $subscriptionId = az account show --query id -o tsv
+
+          $readinessData = @{
+              environment = "${{ parameters.targetEnvironment }}"
+              timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+              resourceHealth = @()
+              activeAlerts = @()
+              recentActivity = @()
+              riskFactors = @()
+              readinessScore = 100
+          }
+
+          # ──────────────────────────────────────────────
+          # CHECK 1: Azure Resource Health for each target
+          # ──────────────────────────────────────────────
+          Write-Host "1 Resource Health Check" -ForegroundColor Yellow
+
+          $targetResources = @()
+          $resourceIdsJson = '${{ convertToJson(parameters.targetResourceIds) }}'
+          if ($resourceIdsJson -and $resourceIdsJson -ne '[]') {
+            $targetResources = $resourceIdsJson | ConvertFrom-Json
+          }
+
+          foreach ($resourceId in $targetResources) {
+            Write-Host "  Checking: $resourceId"
+            $health = Get-AzureResourceHealth -ResourceId $resourceId -Token $mgmtToken
+            $readinessData.resourceHealth += @{
+                resource = $resourceId
+                status = $health.status
+                summary = $health.summary
+            }
+
+            if ($health.status -ne "Available") {
+              $readinessData.riskFactors += "Resource unhealthy: $resourceId ($($health.status))"
+              $readinessData.readinessScore -= 30
+              Write-Host "    UNHEALTHY: $($health.status) - $($health.summary)" -ForegroundColor Red
+            } else {
+              Write-Host "    Healthy: $($health.status)" -ForegroundColor Green
+            }
+          }
+
+          if ($targetResources.Count -eq 0) {
+            Write-Host "  No target resources specified - skipping resource health check"
+          }
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # CHECK 2: Active Azure Monitor Alerts
+          # ──────────────────────────────────────────────
+          if ("${{ parameters.checkActiveAlerts }}" -eq "true") {
+            Write-Host "2 Active Alerts Check" -ForegroundColor Yellow
+
+            $alerts = Get-AzureMonitorAlerts -SubscriptionId $subscriptionId -Token $mgmtToken -Timespan "1h"
+            $criticalAlerts = $alerts | Where-Object { $_.properties.essentials.severity -in @("Sev0", "Sev1") }
+            $warningAlerts = $alerts | Where-Object { $_.properties.essentials.severity -eq "Sev2" }
+
+            $readinessData.activeAlerts = @{
+                total = $alerts.Count
+                critical = $criticalAlerts.Count
+                warning = $warningAlerts.Count
+            }
+
+            if ($criticalAlerts.Count -gt 0) {
+              $readinessData.riskFactors += "Active critical alerts: $($criticalAlerts.Count)"
+              $readinessData.readinessScore -= (20 * $criticalAlerts.Count)
+              Write-Host "  CRITICAL ALERTS: $($criticalAlerts.Count)" -ForegroundColor Red
+              foreach ($alert in $criticalAlerts) {
+                Write-Host "    - $($alert.properties.essentials.alertRule): $($alert.properties.essentials.description)" -ForegroundColor Red
+              }
+            }
+
+            if ($warningAlerts.Count -gt 0) {
+              $readinessData.riskFactors += "Active warning alerts: $($warningAlerts.Count)"
+              $readinessData.readinessScore -= (5 * $warningAlerts.Count)
+              Write-Host "  Warning alerts: $($warningAlerts.Count)" -ForegroundColor Yellow
+            }
+
+            if ($alerts.Count -eq 0) {
+              Write-Host "  No active alerts - environment looks healthy" -ForegroundColor Green
+            }
+            Write-Host ""
+          }
+
+          # ──────────────────────────────────────────────
+          # CHECK 3: Recent Deployment Activity
+          # ──────────────────────────────────────────────
+          if ("${{ parameters.checkRecentDeployments }}" -eq "true") {
+            Write-Host "3 Recent Activity Check" -ForegroundColor Yellow
+
+            $activity = Get-AzureActivityLog -SubscriptionId $subscriptionId -Token $mgmtToken -HoursBack 2
+            $failedOps = $activity | Where-Object { $_.status.value -eq "Failed" }
+            $deployOps = $activity | Where-Object { $_.operationName.value -match "deploy|write|delete" }
+
+            $readinessData.recentActivity = @{
+                totalEvents = $activity.Count
+                failedOperations = $failedOps.Count
+                deploymentOperations = $deployOps.Count
+            }
+
+            if ($failedOps.Count -gt 3) {
+              $readinessData.riskFactors += "Multiple recent failures: $($failedOps.Count) in last 2 hours"
+              $readinessData.readinessScore -= 15
+              Write-Host "  High failure count: $($failedOps.Count) failed ops in last 2h" -ForegroundColor Yellow
+            }
+
+            if ($deployOps.Count -gt 10) {
+              $readinessData.riskFactors += "High deployment activity: $($deployOps.Count) deploy operations in last 2 hours"
+              $readinessData.readinessScore -= 5
+              Write-Host "  Note: $($deployOps.Count) deployment operations in last 2h" -ForegroundColor Yellow
+            }
+            Write-Host ""
+          }
+
+          # ──────────────────────────────────────────────
+          # CHECK 4: SRE Agent Readiness Assessment
+          # ──────────────────────────────────────────────
+          Write-Host "4 SRE Agent Readiness Assessment" -ForegroundColor Yellow
+
+          $contextData = $readinessData | ConvertTo-Json -Depth 10 -Compress
+          if ($contextData.Length -gt 10000) {
+            $contextData = $contextData.Substring(0, 10000)
+          }
+
+          $sreResult = Invoke-SREAgentAPI `
+            -Action "readiness" `
+            -TargetResourceId ($targetResources | Select-Object -First 1) `
+            -Context $contextData `
+            -Token $aiToken `
+            -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+            -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+            -SubscriptionId $subscriptionId `
+            -SREAgentName "${{ parameters.sreAgentName }}" `
+            -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+
+          if ($sreResult.success) {
+            Write-Host ""
+            Write-Host "--- SRE Agent Readiness Assessment ---" -ForegroundColor Cyan
+            Write-Host $sreResult.response
+            Write-Host "--------------------------------------" -ForegroundColor Cyan
+          }
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # DECISION: GO / NO-GO
+          # ──────────────────────────────────────────────
+          $readinessData.readinessScore = [Math]::Max(0, [Math]::Min(100, $readinessData.readinessScore))
+          $minScore = ${{ parameters.minimumReadinessScore }}
+          $decision = if ($readinessData.readinessScore -ge $minScore) { "GO" } else { "NO-GO" }
+
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   READINESS DECISION: $decision" -ForegroundColor $(if ($decision -eq "GO") { "Green" } else { "Red" })
+          Write-Host "   Score: $($readinessData.readinessScore)/100 (minimum: $minScore)" -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+
+          if ($readinessData.riskFactors.Count -gt 0) {
+            Write-Host ""
+            Write-Host "Risk Factors:" -ForegroundColor Yellow
+            foreach ($risk in $readinessData.riskFactors) {
+              Write-Host "  - $risk" -ForegroundColor Yellow
+            }
+          }
+
+          # Set output variables
+          Write-Host "##vso[task.setvariable variable=ReadinessScore;isOutput=true]$($readinessData.readinessScore)"
+          Write-Host "##vso[task.setvariable variable=ReadinessDecision;isOutput=true]$decision"
+          Write-Host "##vso[task.setvariable variable=RiskFactorCount;isOutput=true]$($readinessData.riskFactors.Count)"
+
+          # Generate readiness report artifact
+          $reportPath = "$(Build.ArtifactStagingDirectory)/sre-readiness-${{ parameters.targetEnvironment }}.md"
+          $reportContent = Format-SREReport `
+            -Title "Pre-Deployment Readiness Report - ${{ parameters.targetEnvironment }}" `
+            -Content @"
+          ## Decision: $decision ($($readinessData.readinessScore)/100)
+
+          ### Resource Health
+          $(($readinessData.resourceHealth | ForEach-Object { "- $($_.resource): **$($_.status)**" }) -join "`n")
+
+          ### Active Alerts
+          - Critical: $($readinessData.activeAlerts.critical)
+          - Warning: $($readinessData.activeAlerts.warning)
+
+          ### Risk Factors
+          $(if ($readinessData.riskFactors.Count -gt 0) { ($readinessData.riskFactors | ForEach-Object { "- $_" }) -join "`n" } else { "None identified" })
+
+          ### SRE Agent Assessment
+          $($sreResult.response)
+          "@
+
+          $reportContent | Out-File -FilePath $reportPath -Encoding utf8
+
+          # Block deployment if NO-GO
+          if ($decision -eq "NO-GO" -and "${{ parameters.blockOnNoGo }}" -eq "true") {
+            Write-Host ""
+            Write-Host "##vso[task.logissue type=error]Deployment blocked: readiness score $($readinessData.readinessScore) below minimum $minScore"
+            Write-Host "##vso[task.complete result=Failed;]Pre-deployment readiness gate failed"
+          } elseif ($decision -eq "NO-GO") {
+            Write-Host "##vso[task.logissue type=warning]Readiness score below threshold but blockOnNoGo=false - proceeding with caution"
+          }
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Readiness Report'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'SREReadinessReport-${{ parameters.targetEnvironment }}'
+        publishLocation: 'Container'
+      continueOnError: true

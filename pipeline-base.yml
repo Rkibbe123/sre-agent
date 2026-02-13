@@ -1,0 +1,633 @@
+# =============================================================================
+# PIPELINE BASE TEMPLATE - WITH AZURE SRE AGENT INTEGRATION
+# =============================================================================
+# A universal pipeline template that injects Azure SRE Agent at every lifecycle
+# touchpoint regardless of what the pipeline actually deploys. SRE Agent provides:
+#   - Pre-deployment readiness gates
+#   - Post-deployment health validation
+#   - Automated rollback on failure
+#   - Incident response automation
+#   - Performance baseline management
+#   - Comprehensive deployment health reporting
+#
+# The SRE Agent integration is additive - all existing AI-powered analysis
+# (code review, log analysis, security scanning) continues to work alongside.
+# =============================================================================
+
+parameters:
+  # ── Existing Parameters ──
+  - name: deployment_type
+    displayName: 'Select Deployment Type'
+    type: string
+    default: 'app-datafabric'
+    values:
+      - app-datafabric
+      - app-claimsanalyzer
+      - app-contractanalyzer
+  - name: clean_bundle-root
+    type: boolean
+    default: false
+  - name: generate_ai_tests
+    displayName: 'Generate AI Tests for Notebooks (WARNING: Can take 20+ minutes)'
+    type: boolean
+    default: false
+  - name: notebooks_path
+    displayName: 'Notebooks Path for AI Test Generation'
+    type: string
+    default: 'notebooks/code/datafabric'
+  - name: run_ai_code_review
+    displayName: 'Run AI Code Review & Security Scan'
+    type: boolean
+    default: true
+  - name: fail_on_critical
+    displayName: 'Fail Pipeline on Critical Security Issues'
+    type: boolean
+    default: false
+  - name: run_smoke_test
+    displayName: 'Run AI-Validated Smoke Test'
+    type: boolean
+    default: true
+  - name: run_resource_optimization
+    displayName: 'Run AI Resource Optimization Analysis'
+    type: boolean
+    default: true
+  - name: fail_on_critical_vulns
+    displayName: 'Fail Pipeline on Critical Vulnerability Findings'
+    type: boolean
+    default: false
+  - name: run_osv_scan
+    displayName: 'Run OSV Dependency Vulnerability Scan'
+    type: boolean
+    default: true
+
+  # ── SRE Agent Parameters ──
+  - name: run_sre_agent
+    displayName: 'Enable Azure SRE Agent Integration'
+    type: boolean
+    default: true
+  - name: sre_pre_deploy_gate
+    displayName: 'Enable Pre-Deployment Readiness Gate'
+    type: boolean
+    default: true
+  - name: sre_post_deploy_validation
+    displayName: 'Enable Post-Deployment Validation'
+    type: boolean
+    default: true
+  - name: sre_automated_rollback
+    displayName: 'Enable Automated Rollback on Failure'
+    type: boolean
+    default: true
+  - name: sre_incident_response
+    displayName: 'Enable Automated Incident Response'
+    type: boolean
+    default: true
+  - name: sre_performance_baseline
+    displayName: 'Enable Performance Baseline Tracking'
+    type: boolean
+    default: true
+  - name: sre_health_report
+    displayName: 'Generate SRE Health Report'
+    type: boolean
+    default: true
+  - name: sre_block_on_no_go
+    displayName: 'Block Deployment if Pre-Deploy Gate Fails'
+    type: boolean
+    default: true
+  - name: sre_fail_on_unhealthy
+    displayName: 'Fail Pipeline if Post-Deploy Validation Unhealthy'
+    type: boolean
+    default: true
+  - name: sre_rollback_strategy
+    displayName: 'Rollback Strategy'
+    type: string
+    default: 'sre-agent-auto'
+    values:
+      - slot-swap
+      - aks-rollback
+      - revert-deploy
+      - custom-script
+      - sre-agent-auto
+  - name: sre_incident_severity
+    displayName: 'Default Incident Severity'
+    type: string
+    default: 'sev2'
+    values:
+      - sev1
+      - sev2
+      - sev3
+      - sev4
+  - name: sre_target_resource_ids
+    displayName: 'Azure Resource IDs to Monitor'
+    type: object
+    default: []
+  - name: sre_agent_resource_group
+    displayName: 'SRE Agent Resource Group'
+    type: string
+    default: 'rg-rkibbe-2470'
+  - name: sre_agent_name
+    displayName: 'SRE Agent Instance Name'
+    type: string
+    default: 'rkibbe'
+  - name: sre_agent_endpoint
+    displayName: 'SRE Agent Endpoint URL'
+    type: string
+    default: 'https://rkibbe--88208374.4650bed8.eastus2.azuresre.ai'
+  - name: sre_teams_webhook_url
+    displayName: 'Microsoft Teams Webhook URL for Incidents'
+    type: string
+    default: ''
+  - name: sre_baseline_storage_account
+    displayName: 'Storage Account for Performance Baselines'
+    type: string
+    default: ''
+  - name: sre_report_storage_account
+    displayName: 'Storage Account for Health Reports'
+    type: string
+    default: ''
+  - name: sre_warmup_seconds
+    displayName: 'Post-Deploy Warmup Wait (seconds)'
+    type: number
+    default: 120
+  - name: sre_minimum_readiness_score
+    displayName: 'Minimum Pre-Deploy Readiness Score (0-100)'
+    type: number
+    default: 70
+
+# ── Centralized Variables (avoids duplication across stages) ──
+variables:
+  - name: azureOpenAIEndpoint
+    value: 'https://rkibbe-chat-demo-resource.services.ai.azure.com/api/projects/rkibbe-chat-demo/applications/azure-devops-ai-agent/protocols/openai/responses?api-version=2025-11-15-preview'
+  - name: azureOpenAIDeployment
+    value: 'cicd-ai-agent'
+
+stages:
+  # ========================================================================
+  # STAGE 1: AI Code Review & Security Scan (existing)
+  # ========================================================================
+  - stage: AICodeReview
+    displayName: "AI Code Review & Security Scan"
+    condition: eq('${{ parameters.run_ai_code_review }}', 'true')
+
+    variables:
+      - group: databricks-dab-pipeline
+      - name: SYSTEM_ENABLEACCESSTOKEN
+        value: 'true'
+      - name: VSO_PROCESS_SECURE_ARGUMENTS
+        value: 'true'
+
+    jobs:
+      - job: CodeReviewAndSecurityScan
+        displayName: 'AI Code Review & Security Analysis'
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          - template: templates/ai-code-review.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              notebooks_path: '${{ parameters.notebooks_path }}'
+              failOnCritical: ${{ parameters.fail_on_critical }}
+
+          - template: templates/osv-dependency-scan.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              failOnCritical: ${{ parameters.fail_on_critical_vulns }}
+              enabled: ${{ parameters.run_osv_scan }}
+              scanPaths:
+                   - 'pipeline/scripts/requirements-ai-tests.txt'
+
+  # ========================================================================
+  # STAGE 2: SRE Agent Pre-Deployment Readiness Gate
+  # ========================================================================
+  # Runs BEFORE any deployment. Checks environment health, active alerts,
+  # recent failures, and SRE Agent readiness assessment. Blocks deployment
+  # if the environment is not ready.
+  # ========================================================================
+  - stage: SREPreDeployGate
+    displayName: "SRE Pre-Deploy Readiness Gate"
+    dependsOn:
+      - AICodeReview
+    condition: |
+      and(
+        eq('${{ parameters.run_sre_agent }}', 'true'),
+        eq('${{ parameters.sre_pre_deploy_gate }}', 'true'),
+        in(dependencies.AICodeReview.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
+      )
+
+    variables:
+      - group: databricks-dab-pipeline
+      - name: SYSTEM_ENABLEACCESSTOKEN
+        value: 'true'
+
+    jobs:
+      - job: PreDeployReadiness
+        displayName: 'SRE Agent Readiness Check'
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          # Initialize SRE Agent (shared helpers + auth)
+          - template: templates/sre-agent-common.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+
+          # Run readiness gate
+          - template: templates/sre-pre-deploy-gate.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              targetEnvironment: 'dev'
+              targetResourceIds: ${{ parameters.sre_target_resource_ids }}
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+              blockOnNoGo: ${{ parameters.sre_block_on_no_go }}
+              minimumReadinessScore: ${{ parameters.sre_minimum_readiness_score }}
+
+          # Capture performance baseline BEFORE deployment
+          - template: templates/sre-performance-baseline.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              action: 'capture'
+              targetResourceIds: ${{ parameters.sre_target_resource_ids }}
+              baselineStorageAccount: '${{ parameters.sre_baseline_storage_account }}'
+              enabled: ${{ parameters.sre_performance_baseline }}
+
+  # ========================================================================
+  # STAGE 3/4/5: Build & Deploy (DEV → QA → Prod)
+  # ========================================================================
+  # Your actual deployment stages go here. They now depend on the SRE
+  # pre-deploy gate passing first.
+  # ========================================================================
+  - stage: BuildDeployDEV
+    displayName: "Build & Deploy to DEV Env"
+    dependsOn:
+      - SREPreDeployGate
+    condition: |
+      or(
+        in(dependencies.SREPreDeployGate.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        eq('${{ parameters.run_sre_agent }}', 'false')
+      )
+    # TODO: Add your DEV deployment jobs here
+
+  - stage: BuildDeployQA
+    displayName: "Build & Deploy to QA Env"
+    dependsOn:
+      - BuildDeployDEV
+      - SREPostDeployValidationDEV
+    condition: |
+      and(
+        in(dependencies.BuildDeployDEV.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.SREPostDeployValidationDEV.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
+      )
+    # TODO: Add your QA deployment jobs here
+
+  - stage: BuildDeployProd
+    displayName: "Build & Deploy to Prod Env"
+    dependsOn:
+      - BuildDeployQA
+      - SREPostDeployValidationQA
+    condition: |
+      and(
+        in(dependencies.BuildDeployQA.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.SREPostDeployValidationQA.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
+      )
+    # TODO: Add your PROD deployment jobs here
+
+  # ========================================================================
+  # STAGE 6: SRE Post-Deployment Validation (DEV)
+  # ========================================================================
+  # Runs immediately after DEV deployment. Checks resource health, detects
+  # anomalies, compares metrics against baselines, and runs SRE Agent
+  # diagnostics. If unhealthy, triggers rollback.
+  # ========================================================================
+  - stage: SREPostDeployValidationDEV
+    displayName: "SRE Post-Deploy Validation (DEV)"
+    dependsOn:
+      - BuildDeployDEV
+    condition: |
+      and(
+        eq('${{ parameters.run_sre_agent }}', 'true'),
+        eq('${{ parameters.sre_post_deploy_validation }}', 'true'),
+        in(dependencies.BuildDeployDEV.result, 'Succeeded', 'SucceededWithIssues')
+      )
+
+    variables:
+      - group: databricks-dab-pipeline
+      - name: SYSTEM_ENABLEACCESSTOKEN
+        value: 'true'
+
+    jobs:
+      - job: PostDeployValidation
+        displayName: 'SRE Agent Post-Deploy Validation'
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          - template: templates/sre-agent-common.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+
+          - template: templates/sre-post-deploy-validation.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              targetEnvironment: 'dev'
+              targetResourceIds: ${{ parameters.sre_target_resource_ids }}
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+              warmupSeconds: ${{ parameters.sre_warmup_seconds }}
+              failOnUnhealthy: ${{ parameters.sre_fail_on_unhealthy }}
+
+          # Compare against baseline
+          - template: templates/sre-performance-baseline.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              action: 'compare'
+              targetResourceIds: ${{ parameters.sre_target_resource_ids }}
+              baselineStorageAccount: '${{ parameters.sre_baseline_storage_account }}'
+              enabled: ${{ parameters.sre_performance_baseline }}
+
+  # ========================================================================
+  # STAGE 7: SRE Post-Deployment Validation (QA)
+  # ========================================================================
+  - stage: SREPostDeployValidationQA
+    displayName: "SRE Post-Deploy Validation (QA)"
+    dependsOn:
+      - BuildDeployQA
+    condition: |
+      and(
+        eq('${{ parameters.run_sre_agent }}', 'true'),
+        eq('${{ parameters.sre_post_deploy_validation }}', 'true'),
+        in(dependencies.BuildDeployQA.result, 'Succeeded', 'SucceededWithIssues')
+      )
+
+    variables:
+      - group: databricks-dab-pipeline
+      - name: SYSTEM_ENABLEACCESSTOKEN
+        value: 'true'
+
+    jobs:
+      - job: PostDeployValidationQA
+        displayName: 'SRE Agent Post-Deploy Validation'
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          - template: templates/sre-agent-common.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+
+          - template: templates/sre-post-deploy-validation.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              targetEnvironment: 'qa'
+              targetResourceIds: ${{ parameters.sre_target_resource_ids }}
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+              warmupSeconds: ${{ parameters.sre_warmup_seconds }}
+              failOnUnhealthy: ${{ parameters.sre_fail_on_unhealthy }}
+
+  # ========================================================================
+  # STAGE 8: SRE Automated Rollback (triggered on validation failure)
+  # ========================================================================
+  - stage: SRERollback
+    displayName: "SRE Automated Rollback"
+    dependsOn:
+      - SREPostDeployValidationDEV
+    condition: |
+      and(
+        eq('${{ parameters.run_sre_agent }}', 'true'),
+        eq('${{ parameters.sre_automated_rollback }}', 'true'),
+        eq(dependencies.SREPostDeployValidationDEV.result, 'Failed')
+      )
+
+    variables:
+      - group: databricks-dab-pipeline
+      - name: SYSTEM_ENABLEACCESSTOKEN
+        value: 'true'
+
+    jobs:
+      - job: AutomatedRollback
+        displayName: 'SRE Agent Automated Rollback'
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          - template: templates/sre-agent-common.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+
+          - template: templates/sre-automated-rollback.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              rollbackStrategy: '${{ parameters.sre_rollback_strategy }}'
+              targetEnvironment: 'dev'
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+
+  # ========================================================================
+  # STAGE 9: SRE Incident Response (triggered on any failure)
+  # ========================================================================
+  - stage: SREIncidentResponse
+    displayName: "SRE Incident Response"
+    dependsOn:
+      - BuildDeployDEV
+      - SREPostDeployValidationDEV
+      - SRERollback
+    condition: |
+      and(
+        eq('${{ parameters.run_sre_agent }}', 'true'),
+        eq('${{ parameters.sre_incident_response }}', 'true'),
+        or(
+          eq(dependencies.BuildDeployDEV.result, 'Failed'),
+          eq(dependencies.SREPostDeployValidationDEV.result, 'Failed'),
+          eq(dependencies.SRERollback.result, 'Failed')
+        )
+      )
+
+    variables:
+      - group: databricks-dab-pipeline
+      - name: SYSTEM_ENABLEACCESSTOKEN
+        value: 'true'
+
+    jobs:
+      - job: IncidentResponse
+        displayName: 'SRE Agent Incident Response'
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          - template: templates/sre-agent-common.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+
+          - template: templates/sre-incident-response.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              incidentSeverity: '${{ parameters.sre_incident_severity }}'
+              createWorkItem: true
+              notifyTeams: true
+              teamsWebhookUrl: '${{ parameters.sre_teams_webhook_url }}'
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+              targetResourceIds: ${{ parameters.sre_target_resource_ids }}
+
+  # ========================================================================
+  # STAGE 10: AI-Powered Post-Build Analysis (existing, enhanced)
+  # ========================================================================
+  - stage: PostBuildAIAnalysis
+    displayName: "AI-Powered Post-Build Analysis"
+    dependsOn:
+      - BuildDeployDEV
+      - SREPostDeployValidationDEV
+    condition: always()
+
+    variables:
+      - group: databricks-dab-pipeline
+      - name: SYSTEM_ENABLEACCESSTOKEN
+        value: 'true'
+      - name: VSO_PROCESS_SECURE_ARGUMENTS
+        value: 'true'
+
+    jobs:
+      - job: AILogAnalysis
+        displayName: 'AI Log Analysis'
+        pool:
+          vmImage: 'windows-latest'
+
+        steps:
+          - checkout: none
+            displayName: 'Skip Checkout'
+
+          # NOTE: generate-audit-page.yml template is not yet implemented.
+          # Uncomment when the template is created:
+          # - template: templates/generate-audit-page.yml
+          #   parameters:
+          #     azureServiceConnection: 'azure-devops-sp2'
+          #     azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+          #     azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+          #     storageAccount: 'ariinventorystorage'
+          #     containerName: 'pipelineauditlogs'
+          #     buildId: '$(Build.BuildId)'
+          #     buildNumber: '$(Build.BuildNumber)'
+          #     branch: '$(Build.SourceBranch)'
+          #     deploymentType: '${{ parameters.deployment_type }}'
+          #     project: '$(System.TeamProject)'
+          #     repository: '$(Build.Repository.Name)'
+          #     runBy: '$(Build.RequestedFor)'
+          #     approvalStatus: '$(Release.ApprovalStatus)'
+          #     failOnCritical: ${{ parameters.fail_on_critical }}
+
+          - template: templates/ai-build-log-analysis.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              deploymentType: '${{ parameters.deployment_type }}'
+
+  # ========================================================================
+  # STAGE 11: SRE Deployment Health Report (always runs last)
+  # ========================================================================
+  # Generates a comprehensive deployment health report with MTTD/MTTR metrics,
+  # deployment scorecard, and SRE Agent executive summary. Also updates
+  # performance baselines on successful deployments.
+  # ========================================================================
+  - stage: SREHealthReport
+    displayName: "SRE Deployment Health Report"
+    dependsOn:
+      - AICodeReview
+      - SREPreDeployGate
+      - BuildDeployDEV
+      - SREPostDeployValidationDEV
+      - SRERollback
+      - SREIncidentResponse
+      - PostBuildAIAnalysis
+    condition: |
+      and(
+        eq('${{ parameters.run_sre_agent }}', 'true'),
+        eq('${{ parameters.sre_health_report }}', 'true'),
+        always()
+      )
+
+    variables:
+      - group: databricks-dab-pipeline
+      - name: SYSTEM_ENABLEACCESSTOKEN
+        value: 'true'
+
+    jobs:
+      - job: HealthReport
+        displayName: 'SRE Agent Health Report'
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          - template: templates/sre-agent-common.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+
+          # Update baselines on successful deployment
+          - template: templates/sre-performance-baseline.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              action: 'update'
+              targetResourceIds: ${{ parameters.sre_target_resource_ids }}
+              baselineStorageAccount: '${{ parameters.sre_baseline_storage_account }}'
+              enabled: ${{ parameters.sre_performance_baseline }}
+
+          # Generate comprehensive health report
+          - template: templates/sre-health-report.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              targetEnvironment: 'dev'
+              targetResourceIds: ${{ parameters.sre_target_resource_ids }}
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+              storageAccount: '${{ parameters.sre_report_storage_account }}'
+
+          # Run reliability audit as final step
+          - template: templates/sre-reliability-audit.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              targetResourceIds: ${{ parameters.sre_target_resource_ids }}
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+              auditScope: 'health-only'
+              lookbackHours: 1
+
+

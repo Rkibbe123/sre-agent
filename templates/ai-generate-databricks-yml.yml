@@ -1,0 +1,179 @@
+# Template: ai-generate-databricks-yml.yml
+# Purpose: Use AI agent to analyze repo and dynamically generate databricks.yml at repo root
+
+parameters:
+  - name: azureOpenAIEndpoint
+    type: string
+  - name: azureOpenAIDeployment
+    type: string
+  - name: azureServiceConnection
+    type: string
+    default: 'azure-devops-sp2'
+  - name: repositoryDir
+    type: string
+    default: '$(Build.SourcesDirectory)'
+  - name: outputDatabricksYml
+    type: string
+    default: '$(Build.SourcesDirectory)/databricks.yml'
+  - name: jobsFolder
+    type: string
+    default: 'jobs'
+  - name: pipelinesFolder
+    type: string
+    default: 'pipeline-jobs'
+  - name: skipCheckout
+    type: boolean
+    default: true
+  - name: maxBaseChars
+    type: number
+    default: 12000
+  - name: maxFileChars
+    type: number
+    default: 3000
+  - name: maxResourceChars
+    type: number
+    default: 12000
+
+steps:
+  - ${{ if ne(parameters.skipCheckout, true) }}:
+    - checkout: self
+      displayName: 'Checkout Source'
+
+  - task: AzureCLI@2
+    displayName: 'AI: Generate databricks.yml from repo contents'
+    inputs:
+      azureSubscription: ${{ parameters.azureServiceConnection }}
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Write-Host "=== AI-Driven databricks.yml Generation ===" -ForegroundColor Cyan
+        $repoRoot = "${{ parameters.repositoryDir }}"
+        $existingYml = "${{ parameters.outputDatabricksYml }}"
+        $jobsDir = Join-Path $repoRoot "${{ parameters.jobsFolder }}"
+        $pipelinesDir = Join-Path $repoRoot "${{ parameters.pipelinesFolder }}"
+        $maxBaseChars = [int]"${{ parameters.maxBaseChars }}"
+        $maxFileChars = [int]"${{ parameters.maxFileChars }}"
+        $maxResourceChars = [int]"${{ parameters.maxResourceChars }}"
+
+        if (-not (Test-Path $repoRoot)) {
+          Write-Host "##vso[task.logissue type=error]Repository directory not found: $repoRoot"
+          exit 1
+        }
+
+        if (-not $existingYml) {
+          $existingYml = Join-Path $repoRoot 'databricks.yml'
+        }
+
+        # Gather resource files
+        $jobFiles = @()
+        if (Test-Path $jobsDir) {
+          $jobFiles = Get-ChildItem -Path $jobsDir -Recurse -File | Where-Object { $_.Extension -in '.yml','.yaml' } | Select-Object -ExpandProperty FullName
+        }
+        $pipelineFiles = @()
+        if (Test-Path $pipelinesDir) {
+          $pipelineFiles = Get-ChildItem -Path $pipelinesDir -Recurse -File | Where-Object { $_.Extension -in '.yml','.yaml' } | Select-Object -ExpandProperty FullName
+        }
+
+        # Read current databricks.yml (if exists)
+        $baseYml = ''
+        if (Test-Path $existingYml) {
+          $baseYml = Get-Content $existingYml -Raw
+          if ($baseYml.Length -gt $maxBaseChars) {
+            $baseYml = $baseYml.Substring(0, $maxBaseChars) + "`n... [truncated]"
+          }
+        }
+
+        function Get-RelativePath([string]$basePath, [string]$fullPath) {
+          $relative = $fullPath.Substring($basePath.Length).TrimStart('\','/')
+          return ($relative -replace '\\','/')
+        }
+
+        function Get-TrimmedContent([string]$path, [int]$maxChars) {
+          $content = Get-Content -Path $path -Raw -ErrorAction SilentlyContinue
+          if (-not $content) { return "" }
+          if ($content.Length -gt $maxChars) {
+            return $content.Substring(0, $maxChars) + "`n... [truncated]"
+          }
+          return $content
+        }
+
+        $resourceSnippets = New-Object System.Collections.Generic.List[string]
+        $remaining = $maxResourceChars
+
+        foreach ($file in ($jobFiles + $pipelineFiles)) {
+          if ($remaining -le 200) { break }
+          $relative = Get-RelativePath -basePath $repoRoot -fullPath $file
+          $content = Get-TrimmedContent -path $file -maxChars $maxFileChars
+          $snippet = "=== $relative ===`n$content"
+          if ($snippet.Length -gt $remaining) {
+            $snippet = $snippet.Substring(0, [Math]::Max(0, $remaining - 20)) + "`n... [truncated]"
+            $resourceSnippets.Add($snippet)
+            $remaining = 0
+            break
+          }
+          $resourceSnippets.Add($snippet)
+          $remaining -= $snippet.Length
+        }
+
+        # Compose prompt for AI agent
+        $prompt = @"
+You are an expert in Databricks Asset Bundles and Azure DevOps.
+Analyze the following repository structure and resource files. Generate an updated databricks.yml file using the current databricks.yml as a base for structure and formatting. If new jobs or pipelines are found, add them to the output. Do not invent resources that do not exist in the repo. Prefer adding include entries that reference the job/pipeline YAML files rather than duplicating resource definitions. Only output the YAML file content (no markdown or code fences).
+
+Current databricks.yml:
+$baseYml
+
+Jobs:
+$($jobFiles -join "`n")
+
+Pipelines:
+$($pipelineFiles -join "`n")
+
+Job and pipeline YAML contents (truncated):
+$($resourceSnippets -join "`n`n")
+
+For each job or pipeline, include a reference in the databricks.yml as appropriate. Preserve existing targets, variables, and sync settings unless updates are required to include new resources.
+"@
+
+        # Get Azure AD token for AI agent
+        $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+        $body = @{
+          model = "${{ parameters.azureOpenAIDeployment }}"
+          input = $prompt
+        } | ConvertTo-Json -Depth 10
+        $uri = "${{ parameters.azureOpenAIEndpoint }}"
+
+        Write-Host "Calling AI agent to generate databricks.yml..."
+        $response = Invoke-RestMethod -Uri $uri -Method POST -Headers @{ "Authorization" = "Bearer $aiToken"; "Content-Type" = "application/json" } -Body $body
+
+        # Parse response (handle various formats)
+        $yml = $null
+        if ($response.output -and $response.output[0].content) {
+          $yml = $response.output[0].content[0].text
+        } elseif ($response.choices -and $response.choices[0].message) {
+          $yml = $response.choices[0].message.content
+        } elseif ($response.text) {
+          $yml = $response.text
+        } elseif ($response.content) {
+          $yml = $response.content
+        } elseif ($response -is [string]) {
+          $yml = $response
+        }
+
+        if (-not $yml) {
+          Write-Host "##vso[task.logissue type=error]AI agent did not return a valid databricks.yml"
+          exit 1
+        }
+
+        # Strip code fences if present
+        $yml = ($yml -replace '```yaml', '') -replace '```', ''
+        $yml = $yml.Trim()
+
+        if (-not ($yml -match '(?m)^\s*(bundle:|resources:)')) {
+          Write-Host "##vso[task.logissue type=warning]AI output did not look like databricks.yml; skipping update."
+          exit 0
+        }
+
+        # Write new databricks.yml to repo root
+        Set-Content -Path $existingYml -Value $yml -Force
+        Write-Host "databricks.yml updated by AI agent."

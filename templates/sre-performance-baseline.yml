@@ -1,0 +1,375 @@
+# =============================================================================
+# SRE Agent Performance Baseline Management
+# =============================================================================
+# Captures, stores, and compares performance baselines across deployments.
+# Detects regressions by comparing current metrics against learned baselines.
+# Feeds data back into CI/CD for continuous improvement loops.
+#
+# Usage:
+#   - template: templates/sre-performance-baseline.yml
+#     parameters:
+#       azureServiceConnection: 'azure-devops-sp2'
+#       action: 'compare'  # capture | compare | update
+#       targetResourceIds:
+#         - '/subscriptions/.../resourceGroups/.../providers/...'
+# =============================================================================
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'cicd-ai-agent'
+  - name: action
+    type: string
+    default: 'compare'
+    values:
+      - capture    # Capture current metrics as new baseline
+      - compare    # Compare current metrics against stored baseline
+      - update     # Update baseline with current metrics (after successful deploy)
+  - name: targetResourceIds
+    type: object
+    default: []
+  - name: sreAgentResourceGroup
+    type: string
+    default: ''
+  - name: sreAgentName
+    type: string
+    default: ''
+  - name: baselineStorageAccount
+    type: string
+    default: ''
+  - name: baselineContainerName
+    type: string
+    default: 'sre-baselines'
+  - name: metricsToBaseline
+    type: string
+    default: 'Availability,SuccessE2ELatency,ServerErrors,Transactions'
+  - name: baselinePeriodHours
+    type: number
+    default: 24
+  - name: regressionThresholdPercent
+    type: number
+    default: 20
+  - name: failOnRegression
+    type: boolean
+    default: false
+  - name: enabled
+    type: boolean
+    default: true
+
+steps:
+  - ${{ if eq(parameters.enabled, true) }}:
+    - task: AzureCLI@2
+      name: SREBaseline
+      displayName: 'SRE Agent: Performance Baseline (${{ parameters.action }})'
+      inputs:
+        azureSubscription: '${{ parameters.azureServiceConnection }}'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   SRE AGENT: PERFORMANCE BASELINE          " -ForegroundColor Cyan
+          Write-Host "   Action: ${{ parameters.action }}" -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host ""
+
+          # Load SRE helpers
+          $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
+          if (Test-Path $helpersPath) { . $helpersPath }
+
+          $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
+          $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+          $subscriptionId = az account show --query id -o tsv
+
+          $targetResources = @()
+          $resourceIdsJson = '${{ convertToJson(parameters.targetResourceIds) }}'
+          if ($resourceIdsJson -and $resourceIdsJson -ne '[]') {
+            $targetResources = $resourceIdsJson | ConvertFrom-Json
+          }
+
+          $baselineDir = "$(Build.ArtifactStagingDirectory)/baselines"
+          New-Item -ItemType Directory -Force -Path $baselineDir | Out-Null
+
+          $regressionThreshold = ${{ parameters.regressionThresholdPercent }}
+          $baselinePeriod = ${{ parameters.baselinePeriodHours }}
+
+          # ──────────────────────────────────────────────
+          # Collect Current Metrics
+          # ──────────────────────────────────────────────
+          Write-Host "Collecting current metrics..." -ForegroundColor Yellow
+
+          $currentMetrics = @{}
+
+          foreach ($resourceId in $targetResources) {
+            $resourceName = $resourceId.Split('/')[-1]
+            $metrics = Get-AzureMonitorMetrics `
+              -ResourceId $resourceId `
+              -Token $mgmtToken `
+              -MetricNames "${{ parameters.metricsToBaseline }}" `
+              -Timespan "PT${baselinePeriod}H" `
+              -Interval "PT1H"
+
+            $resourceMetrics = @{}
+
+            if ($metrics -and $metrics.value) {
+              foreach ($metric in $metrics.value) {
+                $metricName = $metric.name.value
+                $values = @()
+
+                foreach ($ts in $metric.timeseries) {
+                  foreach ($dp in $ts.data) {
+                    if ($dp.average -ne $null) { $values += $dp.average }
+                    elseif ($dp.total -ne $null) { $values += $dp.total }
+                  }
+                }
+
+                if ($values.Count -gt 0) {
+                  $sorted = $values | Sort-Object
+                  $resourceMetrics[$metricName] = @{
+                      average = [math]::Round(($values | Measure-Object -Average).Average, 4)
+                      p50 = [math]::Round($sorted[[math]::Floor($values.Count * 0.5)], 4)
+                      p95 = [math]::Round($sorted[[math]::Floor($values.Count * 0.95)], 4)
+                      p99 = [math]::Round($sorted[[math]::Floor($values.Count * 0.99)], 4)
+                      min = [math]::Round(($values | Measure-Object -Minimum).Minimum, 4)
+                      max = [math]::Round(($values | Measure-Object -Maximum).Maximum, 4)
+                      stddev = [math]::Round([math]::Sqrt(($values | ForEach-Object { [math]::Pow($_ - ($values | Measure-Object -Average).Average, 2) } | Measure-Object -Average).Average), 4)
+                      count = $values.Count
+                  }
+                  Write-Host "  $resourceName / $metricName : avg=$($resourceMetrics[$metricName].average), p95=$($resourceMetrics[$metricName].p95)"
+                }
+              }
+            }
+            $currentMetrics[$resourceName] = $resourceMetrics
+          }
+
+          $currentBaseline = @{
+              capturedAt = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+              buildNumber = "$(Build.BuildNumber)"
+              buildId = "$(Build.BuildId)"
+              periodHours = $baselinePeriod
+              resources = $currentMetrics
+          }
+
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # Action: Capture / Compare / Update
+          # ──────────────────────────────────────────────
+          $action = "${{ parameters.action }}"
+          $regressions = @()
+
+          switch ($action) {
+
+            "capture" {
+              Write-Host "Capturing new baseline..." -ForegroundColor Yellow
+              $baselinePath = Join-Path $baselineDir "baseline-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
+              $currentBaseline | ConvertTo-Json -Depth 10 | Out-File -FilePath $baselinePath -Encoding utf8
+              Write-Host "  Baseline saved: $baselinePath" -ForegroundColor Green
+
+              # Also save as 'latest' baseline
+              $latestPath = Join-Path $baselineDir "baseline-latest.json"
+              $currentBaseline | ConvertTo-Json -Depth 10 | Out-File -FilePath $latestPath -Encoding utf8
+
+              # Upload to blob storage if configured
+              if ("${{ parameters.baselineStorageAccount }}") {
+                try {
+                  az storage blob upload `
+                    --account-name "${{ parameters.baselineStorageAccount }}" `
+                    --container-name "${{ parameters.baselineContainerName }}" `
+                    --name "baseline-latest.json" `
+                    --file $latestPath `
+                    --overwrite `
+                    --auth-mode login
+                  Write-Host "  Baseline uploaded to blob storage" -ForegroundColor Green
+                } catch {
+                  Write-Host "  Could not upload to blob storage: $_" -ForegroundColor Yellow
+                }
+              }
+            }
+
+            "compare" {
+              Write-Host "Comparing against stored baseline..." -ForegroundColor Yellow
+
+              $storedBaseline = $null
+
+              # Try to download from blob storage
+              if ("${{ parameters.baselineStorageAccount }}") {
+                try {
+                  $tempBaseline = Join-Path $baselineDir "downloaded-baseline.json"
+                  az storage blob download `
+                    --account-name "${{ parameters.baselineStorageAccount }}" `
+                    --container-name "${{ parameters.baselineContainerName }}" `
+                    --name "baseline-latest.json" `
+                    --file $tempBaseline `
+                    --auth-mode login 2>$null
+
+                  if (Test-Path $tempBaseline) {
+                    $storedBaseline = Get-Content $tempBaseline -Raw | ConvertFrom-Json -AsHashtable
+                    Write-Host "  Loaded baseline from build $($storedBaseline.buildNumber) captured at $($storedBaseline.capturedAt)"
+                  }
+                } catch {
+                  Write-Host "  Could not download baseline from blob storage" -ForegroundColor Yellow
+                }
+              }
+
+              if (-not $storedBaseline) {
+                Write-Host "  No stored baseline found - capturing current as baseline" -ForegroundColor Yellow
+                $action = "capture"
+              } else {
+                # Compare metrics
+                Write-Host ""
+                Write-Host "--- Baseline Comparison ---" -ForegroundColor Cyan
+
+                foreach ($resourceName in $currentMetrics.Keys) {
+                  Write-Host ""
+                  Write-Host "  Resource: $resourceName" -ForegroundColor Cyan
+
+                  $storedresource = if ($storedBaseline.resources.ContainsKey($resourceName)) { $storedBaseline.resources[$resourceName] } else { $null }
+                  if (-not $storedResource) {
+                    Write-Host "    No baseline for this resource (new resource?)" -ForegroundColor Yellow
+                    continue
+                  }
+
+                  foreach ($metricName in $currentMetrics[$resourceName].Keys) {
+                    $current = $currentMetrics[$resourceName][$metricName]
+                    $stored = if ($storedResource.ContainsKey($metricName)) { $storedResource[$metricName] } else { $null }
+
+                    if (-not $stored) { continue }
+
+                    $currentAvg = $current.average
+                    $baselineAvg = $stored.average
+                    $baselineStdDev = if ($stored.stddev) { $stored.stddev } else { 0 }
+
+                    if ($baselineAvg -eq 0) { continue }
+
+                    $changePercent = [math]::Round((($currentAvg - $baselineAvg) / $baselineAvg) * 100, 2)
+                    $stdDevDelta = if ($baselineStdDev -gt 0) { [math]::Round(($currentAvg - $baselineAvg) / $baselineStdDev, 2) } else { 0 }
+
+                    # Determine if this is a regression
+                    $isRegression = $false
+                    $isImprovement = $false
+
+                    # For latency/errors: higher is worse
+                    if ($metricName -match "Latency|Error|Failure|5xx") {
+                      if ($changePercent -gt $regressionThreshold) { $isRegression = $true }
+                      elseif ($changePercent -lt -$regressionThreshold) { $isImprovement = $true }
+                    }
+                    # For availability/success: lower is worse
+                    elseif ($metricName -match "Availability|Success") {
+                      if ($changePercent -lt -($regressionThreshold / 10)) { $isRegression = $true }
+                      elseif ($changePercent -gt 0) { $isImprovement = $true }
+                    }
+
+                    $icon = if ($isRegression) { "REGR" } elseif ($isImprovement) { "GOOD" } else { "OK" }
+                    $color = if ($isRegression) { "Red" } elseif ($isImprovement) { "Green" } else { "White" }
+
+                    Write-Host "    [$icon] $metricName : $baselineAvg -> $currentAvg ($changePercent%, ${stdDevDelta}σ)" -ForegroundColor $color
+
+                    if ($isRegression) {
+                      $regressions += @{
+                          resource = $resourceName
+                          metric = $metricName
+                          baselineValue = $baselineAvg
+                          currentValue = $currentAvg
+                          changePercent = $changePercent
+                          stdDevDelta = $stdDevDelta
+                      }
+                    }
+                  }
+                }
+
+                # SRE Agent analysis of comparison
+                if ($regressions.Count -gt 0) {
+                  Write-Host ""
+                  Write-Host "SRE Agent regression analysis..." -ForegroundColor Yellow
+
+                  $sreResult = Invoke-SREAgentAPI `
+                    -Action "baseline" `
+                    -Context @"
+                  BASELINE COMPARISON detected $($regressions.Count) regressions:
+                  $(($regressions | ForEach-Object { "- $($_.resource)/$($_.metric): $($_.baselineValue) -> $($_.currentValue) ($($_.changePercent)% change, $($_.stdDevDelta) std devs)" }) -join "`n")
+
+                  Analyze these regressions and provide:
+                  1. Likely root causes
+                  2. Whether they are genuine regressions or expected changes
+                  3. Recommended actions
+                  "@ `
+                    -Token $aiToken `
+                    -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+                    -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+                    -SubscriptionId $subscriptionId
+
+                  if ($sreResult.success) {
+                    Write-Host $sreResult.response
+                  }
+                }
+              }
+            }
+
+            "update" {
+              Write-Host "Updating baseline with current metrics (post-successful-deploy)..." -ForegroundColor Yellow
+              # Same as capture but explicitly intended for post-deploy
+              $baselinePath = Join-Path $baselineDir "baseline-latest.json"
+              $currentBaseline | ConvertTo-Json -Depth 10 | Out-File -FilePath $baselinePath -Encoding utf8
+
+              if ("${{ parameters.baselineStorageAccount }}") {
+                try {
+                  az storage blob upload `
+                    --account-name "${{ parameters.baselineStorageAccount }}" `
+                    --container-name "${{ parameters.baselineContainerName }}" `
+                    --name "baseline-latest.json" `
+                    --file $baselinePath `
+                    --overwrite `
+                    --auth-mode login
+
+                  # Also save historical snapshot
+                  az storage blob upload `
+                    --account-name "${{ parameters.baselineStorageAccount }}" `
+                    --container-name "${{ parameters.baselineContainerName }}" `
+                    --name "baseline-$(Build.BuildNumber).json" `
+                    --file $baselinePath `
+                    --overwrite `
+                    --auth-mode login
+
+                  Write-Host "  Baseline updated in blob storage" -ForegroundColor Green
+                } catch {
+                  Write-Host "  Could not upload to blob storage: $_" -ForegroundColor Yellow
+                }
+              }
+            }
+          }
+
+          # ──────────────────────────────────────────────
+          # Summary
+          # ──────────────────────────────────────────────
+          Write-Host ""
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   BASELINE $($action.ToUpper()) COMPLETE" -ForegroundColor Cyan
+          Write-Host "   Regressions: $($regressions.Count)" -ForegroundColor $(if ($regressions.Count -gt 0) { "Red" } else { "Green" })
+          Write-Host "============================================" -ForegroundColor Cyan
+
+          # Set output variables
+          Write-Host "##vso[task.setvariable variable=BaselineAction;isOutput=true]$action"
+          Write-Host "##vso[task.setvariable variable=RegressionCount;isOutput=true]$($regressions.Count)"
+          Write-Host "##vso[task.setvariable variable=HasRegressions;isOutput=true]$(if ($regressions.Count -gt 0) { 'true' } else { 'false' })"
+
+          # Fail on regression if configured
+          if ($regressions.Count -gt 0 -and "${{ parameters.failOnRegression }}" -eq "true") {
+            Write-Host "##vso[task.logissue type=error]$($regressions.Count) performance regressions detected against baseline"
+            Write-Host "##vso[task.complete result=Failed;]Performance regression detected"
+          } elseif ($regressions.Count -gt 0) {
+            Write-Host "##vso[task.logissue type=warning]$($regressions.Count) performance regressions detected - review recommended"
+          }
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Baseline Data'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/baselines'
+        ArtifactName: 'SREBaselines'
+        publishLocation: 'Container'
+      continueOnError: true

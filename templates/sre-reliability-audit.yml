@@ -1,0 +1,345 @@
+# =============================================================================
+# SRE Agent Reliability Audit
+# =============================================================================
+# Comprehensive reliability audit suitable for scheduled runs (nightly/weekly).
+# Evaluates: SLO compliance, error budgets, resource utilization, configuration
+# drift, security posture, backup status, and scaling policies.
+#
+# Usage (scheduled pipeline):
+#   schedules:
+#     - cron: "0 3 * * *"    # Nightly at 3 AM
+#       branches:
+#         include: [main]
+#
+#   - template: templates/sre-reliability-audit.yml
+#     parameters:
+#       azureServiceConnection: 'azure-devops-sp2'
+#       targetResourceIds:
+#         - '/subscriptions/.../resourceGroups/.../providers/...'
+# =============================================================================
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'cicd-ai-agent'
+  - name: targetResourceIds
+    type: object
+    default: []
+  - name: sreAgentResourceGroup
+    type: string
+    default: ''
+  - name: sreAgentName
+    type: string
+    default: ''
+  - name: auditScope
+    type: string
+    default: 'full'
+    values:
+      - full           # All checks
+      - health-only    # Resource health + alerts only
+      - performance    # Performance metrics focus
+      - security       # Security posture focus
+  - name: lookbackHours
+    type: number
+    default: 24
+  - name: sloTargets
+    type: object
+    default:
+      availability: 99.9
+      latencyP95Ms: 500
+      errorRatePercent: 1
+  - name: failOnSLOBreach
+    type: boolean
+    default: false
+  - name: enabled
+    type: boolean
+    default: true
+
+steps:
+  - ${{ if eq(parameters.enabled, true) }}:
+    - task: AzureCLI@2
+      name: SREReliabilityAudit
+      displayName: 'SRE Agent: Reliability Audit'
+      inputs:
+        azureSubscription: '${{ parameters.azureServiceConnection }}'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   SRE AGENT: RELIABILITY AUDIT             " -ForegroundColor Cyan
+          Write-Host "   Scope: ${{ parameters.auditScope }}" -ForegroundColor Cyan
+          Write-Host "   Lookback: ${{ parameters.lookbackHours }}h" -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host ""
+
+          # Load SRE helpers
+          $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
+          if (Test-Path $helpersPath) { . $helpersPath }
+
+          $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
+          $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+          $subscriptionId = az account show --query id -o tsv
+
+          $lookback = ${{ parameters.lookbackHours }}
+
+          $audit = @{
+              timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+              scope = "${{ parameters.auditScope }}"
+              lookbackHours = $lookback
+              findings = @()
+              resourceHealth = @()
+              metrics = @()
+              alerts = @()
+              sloStatus = @()
+              overallScore = 100
+          }
+
+          $targetResources = @()
+          $resourceIdsJson = '${{ convertToJson(parameters.targetResourceIds) }}'
+          if ($resourceIdsJson -and $resourceIdsJson -ne '[]') {
+            $targetResources = $resourceIdsJson | ConvertFrom-Json
+          }
+
+          # ──────────────────────────────────────────────
+          # AUDIT 1: Resource Health
+          # ──────────────────────────────────────────────
+          Write-Host "AUDIT 1: Resource Health" -ForegroundColor Yellow
+
+          foreach ($resourceId in $targetResources) {
+            $health = Get-AzureResourceHealth -ResourceId $resourceId -Token $mgmtToken
+            $audit.resourceHealth += @{
+                resource = $resourceId.Split('/')[-1]
+                resourceId = $resourceId
+                status = $health.status
+                summary = $health.summary
+            }
+
+            $statusIcon = switch ($health.status) {
+              "Available" { "OK" }
+              "Degraded" { "WARN" }
+              "Unavailable" { "CRIT" }
+              default { "UNKNOWN" }
+            }
+            Write-Host "  [$statusIcon] $($resourceId.Split('/')[-1]): $($health.status)"
+
+            if ($health.status -ne "Available") {
+              $audit.findings += @{ severity = "HIGH"; finding = "Resource $($resourceId.Split('/')[-1]) is $($health.status): $($health.summary)" }
+              $audit.overallScore -= 15
+            }
+          }
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # AUDIT 2: Alert History Analysis
+          # ──────────────────────────────────────────────
+          Write-Host "AUDIT 2: Alert History ($lookback h)" -ForegroundColor Yellow
+
+          $allAlerts = @()
+          try {
+            $apiVersion = "2023-01-01"
+            $uri = "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.AlertsManagement/alerts?api-version=$apiVersion&timeRange=${lookback}h"
+            $alertResult = Invoke-RestMethod -Uri $uri -Headers @{ "Authorization" = "Bearer $mgmtToken" }
+            $allAlerts = $alertResult.value
+          } catch {
+            Write-Host "  Could not fetch alerts: $_" -ForegroundColor Yellow
+          }
+
+          $alertSummary = @{
+              total = $allAlerts.Count
+              sev0 = ($allAlerts | Where-Object { $_.properties.essentials.severity -eq "Sev0" }).Count
+              sev1 = ($allAlerts | Where-Object { $_.properties.essentials.severity -eq "Sev1" }).Count
+              sev2 = ($allAlerts | Where-Object { $_.properties.essentials.severity -eq "Sev2" }).Count
+              fired = ($allAlerts | Where-Object { $_.properties.essentials.monitorCondition -eq "Fired" }).Count
+              resolved = ($allAlerts | Where-Object { $_.properties.essentials.monitorCondition -eq "Resolved" }).Count
+          }
+          $audit.alerts = $alertSummary
+
+          Write-Host "  Total alerts: $($alertSummary.total)"
+          Write-Host "  Critical (Sev0/1): $($alertSummary.sev0 + $alertSummary.sev1)"
+          Write-Host "  Fired: $($alertSummary.fired), Resolved: $($alertSummary.resolved)"
+
+          if ($alertSummary.sev0 -gt 0) {
+            $audit.findings += @{ severity = "CRITICAL"; finding = "$($alertSummary.sev0) Sev0 alerts in last ${lookback}h" }
+            $audit.overallScore -= 20
+          }
+          if ($alertSummary.sev1 -gt 3) {
+            $audit.findings += @{ severity = "HIGH"; finding = "$($alertSummary.sev1) Sev1 alerts in last ${lookback}h (above threshold)" }
+            $audit.overallScore -= 10
+          }
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # AUDIT 3: Performance Metrics vs SLO Targets
+          # ──────────────────────────────────────────────
+          Write-Host "AUDIT 3: SLO Compliance Check" -ForegroundColor Yellow
+
+          $sloTargetsJson = '${{ convertToJson(parameters.sloTargets) }}'
+          $sloTargets = $sloTargetsJson | ConvertFrom-Json
+
+          foreach ($resourceId in $targetResources) {
+            $resourceName = $resourceId.Split('/')[-1]
+            $metrics = Get-AzureMonitorMetrics `
+              -ResourceId $resourceId `
+              -Token $mgmtToken `
+              -MetricNames "Availability,SuccessE2ELatency,Transactions" `
+              -Timespan "PT${lookback}H" `
+              -Interval "PT1H"
+
+            if ($metrics -and $metrics.value) {
+              foreach ($metric in $metrics.value) {
+                $metricName = $metric.name.value
+                $values = @()
+
+                foreach ($ts in $metric.timeseries) {
+                  foreach ($dp in $ts.data) {
+                    if ($dp.average -ne $null) { $values += $dp.average }
+                    elseif ($dp.total -ne $null) { $values += $dp.total }
+                  }
+                }
+
+                if ($values.Count -gt 0) {
+                  $avg = [math]::Round(($values | Measure-Object -Average).Average, 4)
+                  $p95 = if ($values.Count -ge 20) { ($values | Sort-Object)[[math]::Floor($values.Count * 0.95)] } else { ($values | Measure-Object -Maximum).Maximum }
+
+                  $audit.metrics += @{
+                      resource = $resourceName
+                      metric = $metricName
+                      average = $avg
+                      p95 = [math]::Round($p95, 4)
+                      datapoints = $values.Count
+                  }
+
+                  Write-Host "  $resourceName / $metricName : avg=$avg, p95=$([math]::Round($p95,2))"
+
+                  # SLO check
+                  if ($metricName -eq "Availability" -and $avg -lt $sloTargets.availability) {
+                    $audit.sloStatus += @{ metric = "$resourceName/Availability"; target = "$($sloTargets.availability)%"; actual = "$avg%"; status = "BREACHED" }
+                    $audit.findings += @{ severity = "CRITICAL"; finding = "SLO breach: $resourceName availability $avg% < target $($sloTargets.availability)%" }
+                    $audit.overallScore -= 25
+                    Write-Host "    SLO BREACHED: $avg% < $($sloTargets.availability)%" -ForegroundColor Red
+                  }
+                }
+              }
+            }
+          }
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # AUDIT 4: SRE Agent Comprehensive Analysis
+          # ──────────────────────────────────────────────
+          Write-Host "AUDIT 4: SRE Agent Analysis" -ForegroundColor Yellow
+
+          $auditContext = $audit | ConvertTo-Json -Depth 10 -Compress
+          if ($auditContext.Length -gt 12000) { $auditContext = $auditContext.Substring(0, 12000) }
+
+          $sreResult = Invoke-SREAgentAPI `
+            -Action "audit" `
+            -Context @"
+          RELIABILITY AUDIT for subscription $subscriptionId
+          Scope: ${{ parameters.auditScope }}
+          Lookback: ${lookback} hours
+          SLO Targets: Availability=$($sloTargets.availability)%, Latency P95=$($sloTargets.latencyP95Ms)ms, Error Rate=$($sloTargets.errorRatePercent)%
+
+          Collected audit data:
+          $auditContext
+
+          Provide a comprehensive reliability audit covering:
+          1. Availability & Uptime - SLO compliance, error budgets
+          2. Performance - Latency trends, throughput patterns
+          3. Resilience - Failure recovery, redundancy gaps
+          4. Observability - Monitoring coverage, alert quality
+          5. Security - Configuration posture, exposure risks
+          6. Cost efficiency - Over-provisioned or idle resources
+          "@ `
+            -Token $aiToken `
+            -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+            -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+            -SubscriptionId $subscriptionId `
+            -SREAgentName "${{ parameters.sreAgentName }}" `
+            -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+
+          $sreAnalysis = ""
+          if ($sreResult.success) {
+            $sreAnalysis = $sreResult.response
+            Write-Host ""
+            Write-Host "--- SRE Agent Reliability Audit ---" -ForegroundColor Cyan
+            Write-Host $sreAnalysis
+            Write-Host "-----------------------------------" -ForegroundColor Cyan
+          }
+
+          # ──────────────────────────────────────────────
+          # Summary & Report
+          # ──────────────────────────────────────────────
+          $audit.overallScore = [Math]::Max(0, [Math]::Min(100, $audit.overallScore))
+
+          $grade = switch ($true) {
+            ($audit.overallScore -ge 90) { "A" }
+            ($audit.overallScore -ge 80) { "B" }
+            ($audit.overallScore -ge 70) { "C" }
+            ($audit.overallScore -ge 60) { "D" }
+            default { "F" }
+          }
+
+          Write-Host ""
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   RELIABILITY AUDIT SCORE: $($audit.overallScore)/100 ($grade)" -ForegroundColor $(if ($audit.overallScore -ge 80) { "Green" } elseif ($audit.overallScore -ge 60) { "Yellow" } else { "Red" })
+          Write-Host "   Findings: $($audit.findings.Count)" -ForegroundColor Cyan
+          Write-Host "   SLO Breaches: $(($audit.sloStatus | Where-Object { $_.status -eq 'BREACHED' }).Count)" -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+
+          # Set output variables
+          Write-Host "##vso[task.setvariable variable=AuditScore;isOutput=true]$($audit.overallScore)"
+          Write-Host "##vso[task.setvariable variable=AuditGrade;isOutput=true]$grade"
+          Write-Host "##vso[task.setvariable variable=FindingCount;isOutput=true]$($audit.findings.Count)"
+          Write-Host "##vso[task.setvariable variable=SLOBreachCount;isOutput=true]$(($audit.sloStatus | Where-Object { $_.status -eq 'BREACHED' }).Count)"
+
+          # Generate audit report
+          $reportPath = "$(Build.ArtifactStagingDirectory)/sre-reliability-audit.md"
+          $reportContent = Format-SREReport `
+            -Title "Reliability Audit Report" `
+            -Content @"
+          ## Score: $($audit.overallScore)/100 (Grade: $grade)
+
+          ### Resource Health
+          $(($audit.resourceHealth | ForEach-Object { "| $($_.resource) | $($_.status) | $($_.summary) |" }) -join "`n")
+
+          ### Alert Summary (${lookback}h)
+          | Metric | Count |
+          |--------|-------|
+          | Total | $($audit.alerts.total) |
+          | Critical (Sev0) | $($audit.alerts.sev0) |
+          | High (Sev1) | $($audit.alerts.sev1) |
+          | Fired | $($audit.alerts.fired) |
+          | Resolved | $($audit.alerts.resolved) |
+
+          ### SLO Status
+          $(($audit.sloStatus | ForEach-Object { "| $($_.metric) | $($_.target) | $($_.actual) | **$($_.status)** |" }) -join "`n")
+
+          ### Findings
+          $(($audit.findings | ForEach-Object { "- **[$($_.severity)]** $($_.finding)" }) -join "`n")
+
+          ### SRE Agent Analysis
+          $sreAnalysis
+          "@
+          $reportContent | Out-File -FilePath $reportPath -Encoding utf8
+
+          # Fail on SLO breach if configured
+          $sloBreaches = ($audit.sloStatus | Where-Object { $_.status -eq "BREACHED" }).Count
+          if ($sloBreaches -gt 0 -and "${{ parameters.failOnSLOBreach }}" -eq "true") {
+            Write-Host "##vso[task.logissue type=error]$sloBreaches SLO breaches detected"
+            Write-Host "##vso[task.complete result=Failed;]SLO compliance check failed"
+          }
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Reliability Audit Report'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'SREReliabilityAudit'
+        publishLocation: 'Container'
+      continueOnError: true

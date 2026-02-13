@@ -1,0 +1,163 @@
+# Security Scanning Template for CI/CD
+# Scans entire repository for security issues before deployment
+
+parameters:
+  - name: failOnCritical
+    type: boolean
+    default: true
+  - name: scanPath
+    type: string
+    default: '$(Build.SourcesDirectory)'  # Scan entire repo by default
+
+steps:
+  - task: UsePythonVersion@0
+    displayName: 'Setup Python for Security Scan'
+    inputs:
+      versionSpec: '3.10'
+      addToPath: true
+
+  - script: |
+      pip install bandit==1.8.3 semgrep==1.112.0
+    displayName: 'Install Security Tools'
+
+  - script: |
+      echo "============================================"
+      echo "   FULL REPOSITORY SECURITY SCAN           "
+      echo "============================================"
+      
+      SCAN_PATH="${{ parameters.scanPath }}"
+      CRITICAL_FOUND=0
+      WARNING_FOUND=0
+      
+      echo ""
+      echo "🔍 Scanning entire repository for security vulnerabilities..."
+      echo "   Scan path: $SCAN_PATH"
+      
+      # Count files to scan
+      PY_COUNT=$(find $SCAN_PATH -name "*.py" 2>/dev/null | wc -l)
+      NB_COUNT=$(find $SCAN_PATH -name "*.ipynb" 2>/dev/null | wc -l)
+      echo "   Python files: $PY_COUNT"
+      echo "   Notebooks: $NB_COUNT"
+      echo ""
+      
+      # 1. Check for pickle.loads outside of test files
+      echo "--- Checking for pickle.loads in non-test files ---"
+      PICKLE_MATCHES=$(grep -r "pickle\.loads\|pickle\.load(" --include="*.py" --include="*.ipynb" $SCAN_PATH | grep -v "/tests/" | grep -v "test_" || true)
+      if [ -n "$PICKLE_MATCHES" ]; then
+        echo "🔴 CRITICAL: pickle.loads found in non-test files:"
+        echo "$PICKLE_MATCHES"
+        CRITICAL_FOUND=1
+      else
+        echo "✅ No unsafe pickle usage in production code"
+      fi
+      echo ""
+      
+      # 2. Check for traceback.format_exc() printed directly
+      echo "--- Checking for exposed tracebacks ---"
+      TRACEBACK_MATCHES=$(grep -r "print.*traceback\|print.*format_exc\|print.*repr(e)" --include="*.py" --include="*.ipynb" $SCAN_PATH || true)
+      if [ -n "$TRACEBACK_MATCHES" ]; then
+        echo "🔴 CRITICAL: Traceback printed directly to stdout:"
+        echo "$TRACEBACK_MATCHES"
+        CRITICAL_FOUND=1
+      else
+        echo "✅ No exposed tracebacks found"
+      fi
+      echo ""
+      
+      # 3. Check for hardcoded credentials
+      echo "--- Checking for hardcoded credentials ---"
+      CRED_MATCHES=$(grep -rE "(password|api_key|secret|token)\s*=\s*['\"][^'\"]+['\"]" --include="*.py" --include="*.ipynb" $SCAN_PATH | grep -v "dbutils.secrets.get" | grep -v "\.example\." || true)
+      if [ -n "$CRED_MATCHES" ]; then
+        echo "🔴 CRITICAL: Possible hardcoded credentials:"
+        echo "$CRED_MATCHES"
+        CRITICAL_FOUND=1
+      else
+        echo "✅ No hardcoded credentials found"
+      fi
+      echo ""
+      
+      # 4. Check for subprocess pip install (uncontrolled dependencies)
+      echo "--- Checking for uncontrolled pip install ---"
+      PIP_MATCHES=$(grep -r "subprocess.*pip.*install\|os.system.*pip" --include="*.py" --include="*.ipynb" $SCAN_PATH || true)
+      if [ -n "$PIP_MATCHES" ]; then
+        echo "🟡 WARNING: Runtime pip install found (supply chain risk):"
+        echo "$PIP_MATCHES"
+        WARNING_FOUND=1
+      else
+        echo "✅ No runtime pip install found"
+      fi
+      echo ""
+      
+      # 5. Check for SQL injection patterns
+      echo "--- Checking for SQL injection patterns ---"
+      SQL_MATCHES=$(grep -rE "spark\.sql\s*\(\s*f['\"]|execute\s*\(\s*f['\"]" --include="*.py" --include="*.ipynb" $SCAN_PATH || true)
+      if [ -n "$SQL_MATCHES" ]; then
+        echo "🔴 CRITICAL: Possible SQL injection (f-string in SQL):"
+        echo "$SQL_MATCHES"
+        CRITICAL_FOUND=1
+      else
+        echo "✅ No SQL injection patterns found"
+      fi
+      echo ""
+      
+      # 6. Check for print statements with exception details
+      echo "--- Checking for unsafe error printing ---"
+      ERROR_PRINT_MATCHES=$(grep -rE "print.*\{.*e\}|print.*str\(e\)|print.*Error.*\{" --include="*.py" --include="*.ipynb" $SCAN_PATH || true)
+      if [ -n "$ERROR_PRINT_MATCHES" ]; then
+        echo "🟡 WARNING: Unsafe error printing (may leak secrets):"
+        echo "$ERROR_PRINT_MATCHES" | head -20
+        WARNING_FOUND=1
+      fi
+      echo ""
+      
+      # Summary
+      echo "============================================"
+      echo "   FULL REPO SECURITY SCAN SUMMARY         "
+      echo "============================================"
+      
+      if [ $CRITICAL_FOUND -eq 1 ]; then
+        echo "🔴 CRITICAL issues found - must be fixed before merge"
+        if [ "${{ parameters.failOnCritical }}" = "true" ]; then
+          exit 1
+        fi
+      fi
+      
+      if [ $WARNING_FOUND -eq 1 ]; then
+        echo "🟡 Warnings found - should be reviewed"
+        echo "##vso[task.logissue type=warning]Security warnings detected"
+      fi
+      
+      if [ $CRITICAL_FOUND -eq 0 ] && [ $WARNING_FOUND -eq 0 ]; then
+        echo "✅ No security issues found"
+      fi
+      
+    displayName: 'Run Security Pattern Scan'
+    continueOnError: ${{ not(parameters.failOnCritical) }}
+
+  - script: |
+      echo "Running Bandit security scan..."
+      bandit -r ${{ parameters.scanPath }} -f json -o bandit-report.json --severity-level medium || true
+      
+      if [ -f bandit-report.json ]; then
+        ISSUES=$(python3 -c "import json; print(len(json.load(open('bandit-report.json')).get('results', [])))")
+        echo "Bandit found $ISSUES issues"
+        echo "##vso[task.setvariable variable=BanditReportExists]true"
+        
+        if [ "$ISSUES" -gt 0 ]; then
+          echo "##vso[task.logissue type=warning]Bandit found $ISSUES security issues"
+          python3 -c "import json; [print('[%s] %s:%s - %s' % (r.get('issue_severity','?'), r.get('filename','?'), r.get('line_number',0), r.get('issue_text',''))) for r in json.load(open('bandit-report.json')).get('results', [])[:10]]"
+        fi
+      else
+        echo "No bandit-report.json generated (no Python files found or Bandit failed)"
+        echo "##vso[task.setvariable variable=BanditReportExists]false"
+      fi
+    displayName: 'Run Bandit Security Scan'
+    continueOnError: true
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish Security Reports'
+    inputs:
+      PathtoPublish: 'bandit-report.json'
+      ArtifactName: 'SecurityReports'
+    condition: and(always(), ne(variables['Agent.JobStatus'], 'Canceled'), eq(variables['BanditReportExists'], 'true'))
+    continueOnError: true

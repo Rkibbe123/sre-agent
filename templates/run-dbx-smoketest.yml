@@ -1,0 +1,24 @@
+# Azure DevOps template for running the Databricks smoke test notebook as a job
+parameters:
+  - name: azureSubscription
+    type: string
+  - name: databricksHost
+    type: string
+  - name: smokeTestJobId
+    type: string
+
+steps:
+- task: AzureCLI@2
+  displayName: 'Run Databricks Smoke Test Job'
+  inputs:
+    azureSubscription: ${{ parameters.azureSubscription }}
+    addSpnToEnvironment: true
+    scriptType: ps
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      echo "Running Databricks smoke test job..."
+      databricks jobs run-now --job-id ${{ parameters.smokeTestJobId }}
+  env:
+    DATABRICKS_HOST: ${{ parameters.databricksHost }}
+    #DATABRICKS_TOKEN: $(DATABRICKS_TOKEN)
+    # Add DATABRICKS_TOKEN as needed

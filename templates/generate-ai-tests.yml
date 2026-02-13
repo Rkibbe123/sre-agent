@@ -1,0 +1,211 @@
+# AI Test Generation Template for Databricks Notebooks
+# Generates pytest tests from notebooks using Azure OpenAI
+
+parameters:
+  - name: notebooks_path
+    type: string
+    default: 'notebooks/code/datafabric'
+  - name: output_dir
+    type: string
+    default: 'generated_tests'
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'cicd-ai-agent'
+  - name: enabled
+    type: boolean
+    default: true
+  - name: maxNotebooks
+    type: number
+    default: 3  # Limit notebooks to process (0 = all)
+
+steps:
+  - ${{ if eq(parameters.enabled, true) }}:
+    - task: UsePythonVersion@0
+      displayName: 'Setup Python for AI Test Gen'
+      inputs:
+        versionSpec: '3.10'
+        addToPath: true
+
+    - script: |
+        pip install openai pytest pyspark
+      displayName: 'Install AI Test Gen Dependencies'
+
+    - task: AzureCLI@2
+      displayName: 'Generate AI Tests for Notebooks'
+      inputs:
+        azureSubscription: '${{ parameters.azureServiceConnection }}'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          Write-Host "=== AI-Powered Test Generation ===" -ForegroundColor Cyan
+          
+          $notebooksPath = "$(Build.SourcesDirectory)/${{ parameters.notebooks_path }}"
+          $outputDir = "$(Build.SourcesDirectory)/${{ parameters.output_dir }}"
+          
+          # Create output directory
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+          
+          # Get Azure AD token for Azure OpenAI
+          $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+          
+          # Find all notebooks
+          $notebooks = Get-ChildItem -Path $notebooksPath -Filter "*.ipynb" -Recurse | 
+                       Where-Object { $_.FullName -notmatch "unittest|test" }
+          
+          $maxNotebooks = ${{ parameters.maxNotebooks }}
+          $totalNotebooks = $notebooks.Count
+          
+          # Limit notebooks if maxNotebooks is set (> 0)
+          if ($maxNotebooks -gt 0 -and $notebooks.Count -gt $maxNotebooks) {
+              Write-Host "Limiting to first $maxNotebooks notebooks (found $totalNotebooks total)" -ForegroundColor Yellow
+              $notebooks = $notebooks | Select-Object -First $maxNotebooks
+          }
+          
+          Write-Host "Processing $($notebooks.Count) of $totalNotebooks notebooks"
+          
+          foreach ($notebook in $notebooks) {
+              Write-Host ""
+              Write-Host "Processing: $($notebook.Name)" -ForegroundColor Yellow
+              
+              try {
+                  # Read notebook content
+                  $content = Get-Content -Path $notebook.FullName -Raw -ErrorAction Stop
+                  
+                  # Extract code cells (handle both JSON and XML formats)
+                  $codeCells = @()
+                  if ($content.TrimStart().StartsWith("{")) {
+                      # JSON format
+                      $nbJson = $content | ConvertFrom-Json
+                      foreach ($cell in $nbJson.cells) {
+                          if ($cell.cell_type -eq "code") {
+                              $codeCells += ($cell.source -join "`n")
+                          }
+                      }
+                  } else {
+                      # VSCode XML format
+                      $matches = [regex]::Matches($content, '<VSCode\.Cell[^>]*language="python"[^>]*>(.*?)</VSCode\.Cell>', 'Singleline')
+                      foreach ($match in $matches) {
+                          $codeCells += $match.Groups[1].Value
+                      }
+                  }
+                  
+                  if ($codeCells.Count -eq 0) {
+                      Write-Host "  No code cells found, skipping"
+                      continue
+                  }
+                  
+                  # Truncate code to fit token limits
+                  $codeContent = ($codeCells -join "`n`n# --- Next Cell ---`n`n")
+                  if ($codeContent.Length -gt 8000) {
+                      $codeContent = $codeContent.Substring(0, 8000) + "`n... [truncated]"
+                  }
+                  
+                  $prompt = @"
+          Generate pytest test cases for this Databricks notebook code.
+          
+          NOTEBOOK: $($notebook.BaseName)
+          
+          CODE:
+          $codeContent
+          
+          Generate a complete pytest file with:
+          1. Mock fixtures for SparkSession and dbutils
+          2. Unit tests for each function found
+          3. Edge case tests (nulls, empty DataFrames)
+          4. Data quality assertions
+          
+          Use @pytest.fixture and @pytest.mark.parametrize where appropriate.
+          Include docstrings. Return ONLY Python code.
+          "@
+                  
+                  $body = @{
+                      model = "${{ parameters.azureOpenAIDeployment }}"
+                      input = $prompt
+                  } | ConvertTo-Json -Depth 10
+                  
+                  $uri = "${{ parameters.azureOpenAIEndpoint }}"
+                  
+                  $response = Invoke-RestMethod -Uri $uri `
+                      -Method POST `
+                      -Headers @{
+                          "Authorization" = "Bearer $aiToken"
+                          "Content-Type" = "application/json"
+                      } `
+                      -Body $body
+                  
+                  # Parse response - handle different formats
+                  $testCode = $null
+                  if ($response.output -and $response.output[0].content) { $testCode = $response.output[0].content[0].text }
+                  elseif ($response.choices -and $response.choices[0].message) { $testCode = $response.choices[0].message.content }
+                  elseif ($response.text) { $testCode = $response.text }
+                  elseif ($response.content) { $testCode = $response.content }
+                  elseif ($response -is [string]) { $testCode = $response }
+                  
+                  if (-not $testCode) { throw "Unable to parse AI response" }
+                  
+                  # Clean up code block markers
+                  $testCode = $testCode -replace '```python', '' -replace '```', ''
+                  
+                  # Write test file
+                  $testFileName = "test_$($notebook.BaseName).py"
+                  $testFilePath = Join-Path $outputDir $testFileName
+                  Set-Content -Path $testFilePath -Value $testCode.Trim()
+                  
+                  Write-Host "  Generated: $testFileName" -ForegroundColor Green
+                  
+              } catch {
+                  Write-Host "  ERROR: $_" -ForegroundColor Red
+              }
+          }
+          
+          # Summary
+          $generatedTests = Get-ChildItem -Path $outputDir -Filter "test_*.py"
+          Write-Host ""
+          Write-Host "========================================" -ForegroundColor Cyan
+          Write-Host "Generated $($generatedTests.Count) test files" -ForegroundColor Cyan
+          Write-Host "Output: $outputDir" -ForegroundColor Cyan
+          Write-Host "========================================" -ForegroundColor Cyan
+
+    # Execute the generated tests
+    - script: |
+        echo "============================================"
+        echo "   EXECUTING AI-GENERATED TESTS            "
+        echo "============================================"
+        
+        cd $(Build.SourcesDirectory)/${{ parameters.output_dir }}
+        
+        # List generated test files
+        echo ""
+        echo "Test files to execute:"
+        ls -la test_*.py 2>/dev/null || dir test_*.py 2>nul
+        
+        # Install test dependencies
+        pip install pytest pytest-html pytest-cov mock pyspark 2>/dev/null || pip install pytest pytest-html pytest-cov mock pyspark
+        
+        echo ""
+        echo "Running pytest..."
+        echo ""
+        
+        # Run tests with detailed output and HTML report
+        python -m pytest . -v --tb=short --html=test_report.html --self-contained-html -x --timeout=60 2>&1 || true
+        
+        echo ""
+        echo "============================================"
+        echo "   TEST EXECUTION COMPLETE                 "
+        echo "============================================"
+      displayName: 'Execute AI-Generated Tests'
+      continueOnError: true
+      condition: succeeded()
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish AI Generated Tests'
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)/${{ parameters.output_dir }}'
+        ArtifactName: 'AIGeneratedTests'
+        publishLocation: 'Container'
+      condition: succeededOrFailed()

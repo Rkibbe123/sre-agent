@@ -1,0 +1,336 @@
+# Template: osv-dependency-scan.yml
+# Purpose: Scan third-party dependencies for known vulnerabilities using OSV-Scanner
+#          and feed results to Azure OpenAI agent for triage and remediation guidance.
+#
+# Prerequisites:
+#   - Dependency files must have pinned versions for accurate vulnerability matching
+#   - Runs on ubuntu-latest (Linux agent) for the OSV-Scanner binary
+#
+# Usage:
+#   - template: templates/osv-dependency-scan.yml
+#     parameters:
+#       azureServiceConnection: 'azure-devops-sp2'
+#       azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+#       azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+
+parameters:
+  - name: scanPaths
+    type: object
+    default:
+      - 'pipeline/scripts/requirements-ai-tests.txt'
+  - name: osvScannerVersion
+    type: string
+    default: 'v1.9.1'
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+  - name: azureOpenAIDeployment
+    type: string
+  - name: failOnCritical
+    type: boolean
+    default: false
+  - name: enabled
+    type: boolean
+    default: true
+
+steps:
+  - ${{ if eq(parameters.enabled, true) }}:
+    - script: |
+        set -e
+        echo "============================================"
+        echo "   OSV-Scanner Dependency Vulnerability Scan"
+        echo "============================================"
+        echo ""
+
+        OSV_VERSION="${{ parameters.osvScannerVersion }}"
+        DOWNLOAD_URL="https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
+
+        echo "Downloading OSV-Scanner ${OSV_VERSION}..."
+        curl -fsSL "$DOWNLOAD_URL" -o osv-scanner
+        chmod +x osv-scanner
+
+        echo "Installed OSV-Scanner:"
+        ./osv-scanner --version || echo "(version flag not supported)"
+        echo ""
+      displayName: 'Install OSV-Scanner'
+
+    - script: |
+        set +e
+        echo "============================================"
+        echo "   Scanning Dependencies for Vulnerabilities"
+        echo "============================================"
+        echo ""
+
+        SCAN_PATHS="${{ join(' ', parameters.scanPaths) }}"
+        RESULTS_DIR="$(Build.ArtifactStagingDirectory)/osv-results"
+        mkdir -p "$RESULTS_DIR"
+
+        COMBINED_RESULTS=""
+        TOTAL_VULNS=0
+        CRITICAL_FOUND=0
+
+        for SCAN_PATH in $SCAN_PATHS; do
+          FULL_PATH="$(Build.SourcesDirectory)/$SCAN_PATH"
+
+          if [ ! -f "$FULL_PATH" ]; then
+            echo "WARNING: File not found: $FULL_PATH (skipping)"
+            COMBINED_RESULTS="${COMBINED_RESULTS}\n=== ${SCAN_PATH} ===\nFile not found - skipped\n"
+            continue
+          fi
+
+          echo "Scanning: $SCAN_PATH"
+          echo "  Full path: $FULL_PATH"
+
+          # Run OSV-Scanner and capture output
+          SCAN_OUTPUT=$(./osv-scanner --lockfile="$FULL_PATH" --format json 2>&1) || true
+
+          # Save individual results
+          BASENAME=$(basename "$SCAN_PATH" | sed 's/[^a-zA-Z0-9_-]/_/g')
+          echo "$SCAN_OUTPUT" > "$RESULTS_DIR/osv-${BASENAME}.json"
+
+          # Count vulnerabilities from JSON output
+          VULN_COUNT=$(echo "$SCAN_OUTPUT" | python3 -c "
+        import sys, json
+        try:
+            data = json.load(sys.stdin)
+            vulns = data.get('results', [])
+            total = sum(len(r.get('packages', [{}])[0].get('vulnerabilities', [])) if r.get('packages') else 0 for r in vulns)
+            print(total)
+        except:
+            print(0)
+          " 2>/dev/null || echo "0")
+
+          echo "  Vulnerabilities found: $VULN_COUNT"
+          TOTAL_VULNS=$((TOTAL_VULNS + VULN_COUNT))
+
+          # Check for critical/high severity
+          HAS_CRITICAL=$(echo "$SCAN_OUTPUT" | python3 -c "
+        import sys, json
+        try:
+            data = json.load(sys.stdin)
+            for result in data.get('results', []):
+                for pkg in result.get('packages', []):
+                    for vuln in pkg.get('vulnerabilities', []):
+                        for sev in vuln.get('database_specific', {}).get('severity', []):
+                            if sev.upper() in ['CRITICAL', 'HIGH']:
+                                print('yes')
+                                sys.exit(0)
+                        for sev in vuln.get('severity', []):
+                            score = sev.get('score', '')
+                            if isinstance(score, (int, float)) and score >= 7.0:
+                                print('yes')
+                                sys.exit(0)
+            print('no')
+        except:
+            print('no')
+          " 2>/dev/null || echo "no")
+
+          if [ "$HAS_CRITICAL" = "yes" ]; then
+            CRITICAL_FOUND=1
+          fi
+
+          COMBINED_RESULTS="${COMBINED_RESULTS}\n=== ${SCAN_PATH} (${VULN_COUNT} vulnerabilities) ===\n${SCAN_OUTPUT}\n"
+          echo ""
+        done
+
+        echo "============================================"
+        echo "   SCAN SUMMARY"
+        echo "============================================"
+        echo "Total vulnerabilities found: $TOTAL_VULNS"
+        echo "Critical/High found: $( [ $CRITICAL_FOUND -eq 1 ] && echo 'YES' || echo 'NO' )"
+        echo ""
+
+        # Export results for the AI analysis step
+        # Use a file to avoid variable size limits
+        echo -e "$COMBINED_RESULTS" > "$RESULTS_DIR/combined-osv-results.txt"
+
+        # Set pipeline variables
+        echo "##vso[task.setvariable variable=OSV_TOTAL_VULNS]$TOTAL_VULNS"
+        echo "##vso[task.setvariable variable=OSV_CRITICAL_FOUND]$CRITICAL_FOUND"
+        echo "##vso[task.setvariable variable=OSV_RESULTS_DIR]$RESULTS_DIR"
+
+        if [ $CRITICAL_FOUND -eq 1 ]; then
+          echo "##vso[task.logissue type=warning]Critical/High vulnerabilities detected in dependencies"
+        fi
+      displayName: 'Run OSV-Scanner'
+
+    - task: AzureCLI@2
+      displayName: 'AI Analysis of Vulnerability Scan'
+      condition: and(succeeded(), ne(variables['OSV_TOTAL_VULNS'], '0'))
+      inputs:
+        azureSubscription: '${{ parameters.azureServiceConnection }}'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   AI-POWERED VULNERABILITY ANALYSIS        " -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host ""
+
+          $resultsDir = "$(OSV_RESULTS_DIR)"
+          $totalVulns = "$(OSV_TOTAL_VULNS)"
+          $criticalFound = "$(OSV_CRITICAL_FOUND)"
+
+          # Read combined results (truncate to fit token limits)
+          $osvResults = ""
+          $combinedPath = Join-Path $resultsDir "combined-osv-results.txt"
+          if (Test-Path $combinedPath) {
+            $osvResults = Get-Content $combinedPath -Raw -ErrorAction SilentlyContinue
+            if ($osvResults.Length -gt 15000) {
+              $osvResults = $osvResults.Substring(0, 15000) + "`n... [truncated - $totalVulns total vulnerabilities]"
+            }
+          }
+
+          if (-not $osvResults -or $osvResults.Trim().Length -eq 0) {
+            Write-Host "No vulnerability data to analyze."
+            return
+          }
+
+          Write-Host "Analyzing $totalVulns vulnerabilities with AI agent..."
+          Write-Host ""
+
+          # Get Azure AD token for AI agent
+          $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+
+          $prompt = @"
+          You are a senior security engineer performing a dependency vulnerability audit for a Databricks Asset Bundle CI/CD pipeline running on Azure DevOps.
+
+          Analyze the following OSV-Scanner results and provide:
+
+          **1. SEVERITY ASSESSMENT**
+          - Categorize each vulnerability by severity (Critical, High, Medium, Low)
+          - Identify which are actively exploited in the wild
+          - Note any with public proof-of-concept exploits
+
+          **2. EXPLOITABILITY IN CONTEXT**
+          - Which vulnerabilities are actually exploitable in a Databricks/Azure DevOps CI/CD pipeline context?
+          - Which affect build agents vs. runtime environments vs. both?
+          - Are any reachable through the code paths used in this project (pipeline automation, notebook testing, PySpark)?
+
+          **3. REMEDIATION STEPS**
+          - For each vulnerability, provide the specific version upgrade needed
+          - If no fix exists, recommend alternative packages or mitigations
+          - Prioritize fixes by risk and effort
+
+          **4. SUPPLY CHAIN RISKS**
+          - Flag any packages with known supply chain concerns
+          - Note any dependencies that are unmaintained or deprecated
+          - Identify transitive dependency risks
+
+          **Format:** Use these severity prefixes:
+          - CRITICAL: Immediate action required
+          - HIGH: Fix before next deployment
+          - MEDIUM: Plan remediation within sprint
+          - LOW: Track and address opportunistically
+
+          **OSV-Scanner Results:**
+          $osvResults
+          "@
+
+          $body = @{
+            model = "${{ parameters.azureOpenAIDeployment }}"
+            input = $prompt
+          } | ConvertTo-Json -Depth 10
+
+          $uri = "${{ parameters.azureOpenAIEndpoint }}"
+
+          try {
+            $response = Invoke-RestMethod -Uri $uri `
+              -Method POST `
+              -Headers @{
+                "Authorization" = "Bearer $aiToken"
+                "Content-Type" = "application/json"
+              } `
+              -Body $body
+
+            # Parse response - handle different Azure AI response formats
+            $analysis = $null
+            if ($response.output -and $response.output[0].content) {
+              $analysis = $response.output[0].content[0].text
+            } elseif ($response.choices -and $response.choices[0].message) {
+              $analysis = $response.choices[0].message.content
+            } elseif ($response.text) {
+              $analysis = $response.text
+            } elseif ($response.content) {
+              $analysis = $response.content
+            } elseif ($response -is [string]) {
+              $analysis = $response
+            }
+
+            if (-not $analysis) {
+              Write-Host "##[debug]Response structure: $($response | ConvertTo-Json -Depth 5 -Compress)"
+              throw "Unable to parse AI response"
+            }
+
+            Write-Host ""
+            Write-Host "========================================" -ForegroundColor Cyan
+            Write-Host "   VULNERABILITY ANALYSIS REPORT        " -ForegroundColor Cyan
+            Write-Host "========================================" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host $analysis
+            Write-Host ""
+            Write-Host "========================================" -ForegroundColor Cyan
+
+            # Count severity markers in analysis
+            $criticalCount = ([regex]::Matches($analysis, "(?i)CRITICAL")).Count
+            $highCount = ([regex]::Matches($analysis, "(?i)\bHIGH\b")).Count
+
+            # Set output variables
+            Write-Host "##vso[task.setvariable variable=VulnAnalysis;isOutput=true]$($analysis.Substring(0, [Math]::Min(1000, $analysis.Length)))"
+            Write-Host "##vso[task.setvariable variable=CriticalVulns;isOutput=true]$criticalCount"
+            Write-Host "##vso[task.setvariable variable=HighVulns;isOutput=true]$highCount"
+
+            # Report to pipeline
+            if ($criticalCount -gt 0) {
+              Write-Host "##vso[task.logissue type=error]$criticalCount CRITICAL vulnerabilities require immediate attention"
+            }
+            if ($highCount -gt 0) {
+              Write-Host "##vso[task.logissue type=warning]$highCount HIGH severity vulnerabilities detected"
+            }
+
+            # Optionally fail the pipeline on critical findings
+            if ("${{ parameters.failOnCritical }}" -eq "true" -and "$criticalFound" -eq "1") {
+              Write-Host "##vso[task.complete result=Failed;]Critical vulnerabilities detected - pipeline failed per policy"
+            }
+
+          } catch {
+            Write-Host "##vso[task.logissue type=warning]AI vulnerability analysis failed: $_"
+            Write-Host "Error details: $($_.Exception.Message)"
+            Write-Host ""
+            Write-Host "Raw OSV-Scanner results are available in the published artifact."
+          }
+
+          # Generate markdown report
+          $reportPath = Join-Path $resultsDir "vulnerability-report.md"
+          $report = @"
+          # Dependency Vulnerability Report
+
+          **Build:** $(Build.BuildNumber)
+          **Branch:** $(Build.SourceBranch)
+          **Date:** $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          **Scanner:** OSV-Scanner ${{ parameters.osvScannerVersion }}
+
+          ## Summary
+
+          | Metric | Value |
+          |--------|-------|
+          | Total Vulnerabilities | $totalVulns |
+          | Critical/High Found | $( if ($criticalFound -eq '1') { 'Yes' } else { 'No' } ) |
+
+          ## AI Analysis
+
+          $analysis
+          "@
+
+          $report | Out-File -FilePath $reportPath -Encoding utf8
+          Write-Host "Report saved to: $reportPath"
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish OSV Scan Results'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(OSV_RESULTS_DIR)'
+        ArtifactName: 'DependencyVulnerabilityReport'
+        publishLocation: 'Container'
+      continueOnError: true

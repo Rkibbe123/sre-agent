@@ -1,0 +1,142 @@
+# Azure DevOps template for AI-powered Databricks log analysis
+# Uses Azure OpenAI to analyze job outputs for issues and optimization opportunities
+
+parameters:
+  - name: azureSubscription
+    type: string
+    default: 'nprod-dev'
+  - name: azureOpenAIEndpoint
+    type: string
+    default: 'https://rkibbe-chat-demo-resource.services.ai.azure.com/api/projects/rkibbe-chat-demo/applications/azure-devops-ai-agent/protocols/openai/responses?api-version=2025-11-15-preview'
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'cicd-ai-agent'
+  - name: azureOpenAIApiVersion
+    type: string
+    default: '2025-04-01-preview'
+  - name: runId
+    type: string
+    # runId is the Databricks job run identifier returned when a job is triggered
+    # Example: 123456789012345
+    # Get it from: databricks jobs run-now output, or {{tasks.<task>.run_id}} in DAB
+  - name: databricksHost
+    type: string
+    default: ''
+
+steps:
+- task: AzureCLI@2
+  displayName: 'AI Log Analysis'
+  inputs:
+    azureSubscription: ${{ parameters.azureSubscription }}
+    scriptType: pscore
+    addSpnToEnvironment: true
+    inlineScript: |
+      Write-Host "=== AI-Powered Databricks Log Analysis ===" -ForegroundColor Cyan
+      Write-Host "Run ID: ${{ parameters.runId }}"
+      
+      # Get Databricks job output
+      Write-Host "Fetching Databricks run output..."
+      $runOutput = databricks runs get-output --run-id ${{ parameters.runId }} 2>&1
+      
+      if ($LASTEXITCODE -ne 0) {
+          Write-Host "##vso[task.logissue type=warning]Failed to get run output: $runOutput"
+          $runOutput = "Unable to fetch run output for run_id: ${{ parameters.runId }}"
+      }
+      
+      # Get run metadata for additional context
+      $runInfo = databricks runs get --run-id ${{ parameters.runId }} 2>&1 | ConvertFrom-Json
+      $jobName = $runInfo.run_name
+      $state = $runInfo.state.result_state
+      $duration = $runInfo.run_duration
+      
+      Write-Host "Job: $jobName | State: $state | Duration: $($duration/1000)s"
+      
+      # Build the analysis prompt
+      $prompt = @"
+      You are a Databricks and Azure DevOps expert. Analyze this job run output and provide actionable insights.
+      
+      **Job Context:**
+      - Job Name: $jobName
+      - Run ID: ${{ parameters.runId }}
+      - Result State: $state
+      - Duration: $($duration/1000) seconds
+      
+      **Analyze for:**
+      1. **Performance Issues** - Slow stages, data skew, inefficient operations
+      2. **Data Quality Concerns** - Null values, schema mismatches, row count anomalies
+      3. **Security Warnings** - Credential exposure, permission issues
+      4. **Optimization Opportunities** - Caching, partitioning, cluster sizing
+      5. **Error Patterns** - Root cause analysis if failed
+      
+      **Output Format:**
+      - Severity: 🔴 Critical | 🟡 Warning | 🟢 Info
+      - Provide specific line references where applicable
+      - Include remediation steps
+      
+      **Job Output:**
+      $runOutput
+      "@
+      
+      # Get Azure AD token for Azure OpenAI
+      $token = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+      
+      # Prepare the request body for Azure OpenAI
+      $body = @{
+          model = "${{ parameters.azureOpenAIDeployment }}"
+          input = $prompt
+      } | ConvertTo-Json -Depth 10
+      
+      # Call Azure OpenAI Responses API
+      $uri = "${{ parameters.azureOpenAIEndpoint }}"
+      
+      Write-Host "Calling Azure OpenAI for analysis..."
+      
+      # Helper function to parse AI response
+      function Get-AIResponseText($response) {
+          if ($response.output -and $response.output[0].content) { return $response.output[0].content[0].text }
+          if ($response.choices -and $response.choices[0].message) { return $response.choices[0].message.content }
+          if ($response.text) { return $response.text }
+          if ($response.content) { return $response.content }
+          if ($response -is [string]) { return $response }
+          return $null
+      }
+      
+      try {
+          $response = Invoke-RestMethod -Uri $uri `
+              -Method POST `
+              -Headers @{
+                  "Authorization" = "Bearer $token"
+                  "Content-Type" = "application/json"
+              } `
+              -Body $body
+          
+          # Extract the analysis from response
+          $analysis = Get-AIResponseText $response
+          
+          if (-not $analysis) {
+              Write-Host "##[debug]Response structure: $($response | ConvertTo-Json -Depth 5 -Compress)"
+              throw "Unable to parse AI response"
+          }
+          
+          Write-Host ""
+          Write-Host "=== AI Analysis Results ===" -ForegroundColor Green
+          Write-Host $analysis
+          
+          # Set output variable for downstream tasks
+          Write-Host "##vso[task.setvariable variable=AIAnalysis;isOutput=true]$analysis"
+          
+          # Check for critical issues and fail the task if found
+          if ($analysis -match "🔴 Critical") {
+              Write-Host "##vso[task.logissue type=error]Critical issues detected by AI analysis"
+              # Optionally fail: Write-Host "##vso[task.complete result=Failed;]Critical issues found"
+          }
+          elseif ($analysis -match "🟡 Warning") {
+              Write-Host "##vso[task.logissue type=warning]Warnings detected by AI analysis"
+          }
+          
+      } catch {
+          Write-Host "##vso[task.logissue type=warning]AI Analysis failed: $_"
+          Write-Host "Continuing pipeline without AI analysis..."
+      }
+  env:
+    DATABRICKS_HOST: ${{ parameters.databricksHost }}

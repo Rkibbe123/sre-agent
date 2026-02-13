@@ -1,0 +1,2 @@
+# Sensitive provisioning artifacts (contains subscription IDs and UAMI paths)
+agent.json

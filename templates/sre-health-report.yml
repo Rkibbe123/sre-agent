@@ -1,0 +1,329 @@
+# =============================================================================
+# SRE Agent Deployment Health Report
+# =============================================================================
+# End-of-pipeline comprehensive health report. Generates MTTD/MTTR metrics,
+# deployment scorecard, and SRE Agent summary. Designed to run as the final
+# stage of any pipeline to provide a single-pane view of deployment health.
+#
+# Usage:
+#   - template: templates/sre-health-report.yml
+#     parameters:
+#       azureServiceConnection: 'azure-devops-sp2'
+#       targetEnvironment: 'dev'
+# =============================================================================
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'cicd-ai-agent'
+  - name: targetEnvironment
+    type: string
+    default: 'dev'
+  - name: sreAgentResourceGroup
+    type: string
+    default: ''
+  - name: sreAgentName
+    type: string
+    default: ''
+  - name: targetResourceIds
+    type: object
+    default: []
+  - name: includeAIAnalysis
+    type: boolean
+    default: true
+  - name: publishToWiki
+    type: boolean
+    default: false
+  - name: storageAccount
+    type: string
+    default: ''
+  - name: storageContainer
+    type: string
+    default: 'sre-reports'
+  - name: enabled
+    type: boolean
+    default: true
+
+steps:
+  - ${{ if eq(parameters.enabled, true) }}:
+    - task: AzureCLI@2
+      name: SREHealthReport
+      displayName: 'SRE Agent: Health Report (${{ parameters.targetEnvironment }})'
+      condition: always()
+      inputs:
+        azureSubscription: '${{ parameters.azureServiceConnection }}'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   SRE AGENT: DEPLOYMENT HEALTH REPORT      " -ForegroundColor Cyan
+          Write-Host "   Environment: ${{ parameters.targetEnvironment }}" -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host ""
+
+          # Load SRE helpers
+          $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
+          if (Test-Path $helpersPath) { . $helpersPath }
+
+          $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
+          $aiToken = az account get-access-token --resource https://ml.azure.com --query accessToken -o tsv
+          $subscriptionId = az account show --query id -o tsv
+
+          # ──────────────────────────────────────────────
+          # Collect Pipeline Stage Results
+          # ──────────────────────────────────────────────
+          Write-Host "Collecting pipeline data..." -ForegroundColor Yellow
+
+          $pipelineStartTime = "$(Build.BuildStartTime)" 
+          $currentTime = Get-Date
+          
+          # Use Azure DevOps REST API to get pipeline timeline
+          $pat = "$(System.AccessToken)"
+          $orgUrl = "$(System.CollectionUri)"
+          $project = "$(System.TeamProject)"
+          $buildId = "$(Build.BuildId)"
+
+          $stageResults = @()
+          try {
+            $timelineUrl = "${orgUrl}${project}/_apis/build/builds/${buildId}/timeline?api-version=7.1"
+            $timeline = Invoke-RestMethod -Uri $timelineUrl -Headers @{ "Authorization" = "Bearer $pat" }
+
+            foreach ($record in $timeline.records | Where-Object { $_.type -eq "Stage" }) {
+              $duration = 0
+              if ($record.startTime -and $record.finishTime) {
+                $duration = ([datetime]$record.finishTime - [datetime]$record.startTime).TotalMinutes
+              }
+
+              $stageResults += @{
+                  name = $record.name
+                  result = $record.result
+                  state = $record.state
+                  durationMinutes = [math]::Round($duration, 2)
+                  startTime = $record.startTime
+                  finishTime = $record.finishTime
+              }
+            }
+          } catch {
+            Write-Host "  Could not fetch pipeline timeline: $_" -ForegroundColor Yellow
+          }
+
+          # ──────────────────────────────────────────────
+          # Calculate MTTD / MTTR Estimates
+          # ──────────────────────────────────────────────
+          Write-Host "Calculating deployment metrics..." -ForegroundColor Yellow
+
+          $deployStage = $stageResults | Where-Object { $_.name -match "Deploy|Build" -and $_.result -ne $null } | Select-Object -First 1
+          $validationStage = $stageResults | Where-Object { $_.name -match "Validation|PostDeploy|SRE" -and $_.result -ne $null } | Select-Object -First 1
+
+          $totalPipelineDuration = 0
+          if ($stageResults.Count -gt 0) {
+            $totalPipelineDuration = ($stageResults | Measure-Object -Property durationMinutes -Sum).Sum
+          }
+
+          # MTTD = time from deploy end to issue detection
+          $mttdMinutes = if ($validationStage) { $validationStage.durationMinutes } else { "N/A" }
+          # MTTR = total pipeline time for fix cycle (approximate)
+          $mttrMinutes = [math]::Round($totalPipelineDuration, 2)
+
+          $deploymentMetrics = @{
+              totalDurationMinutes = $mttrMinutes
+              stageCount = $stageResults.Count
+              passedStages = ($stageResults | Where-Object { $_.result -eq "succeeded" }).Count
+              failedStages = ($stageResults | Where-Object { $_.result -eq "failed" }).Count
+              skippedStages = ($stageResults | Where-Object { $_.result -eq "skipped" }).Count
+              estimatedMTTD = $mttdMinutes
+              estimatedMTTR = $mttrMinutes
+          }
+
+          Write-Host "  Pipeline duration: $($deploymentMetrics.totalDurationMinutes) min"
+          Write-Host "  Stages: $($deploymentMetrics.passedStages) passed, $($deploymentMetrics.failedStages) failed, $($deploymentMetrics.skippedStages) skipped"
+          Write-Host "  Est. MTTD: $mttdMinutes min"
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # Current Environment Health
+          # ──────────────────────────────────────────────
+          Write-Host "Checking current environment health..." -ForegroundColor Yellow
+
+          $targetResources = @()
+          $resourceIdsJson = '${{ convertToJson(parameters.targetResourceIds) }}'
+          if ($resourceIdsJson -and $resourceIdsJson -ne '[]') {
+            $targetResources = $resourceIdsJson | ConvertFrom-Json
+          }
+
+          $healthStatus = @()
+          foreach ($resourceId in $targetResources) {
+            $health = Get-AzureResourceHealth -ResourceId $resourceId -Token $mgmtToken
+            $healthStatus += @{
+                resource = $resourceId.Split('/')[-1]
+                status = $health.status
+            }
+            Write-Host "  $($resourceId.Split('/')[-1]): $($health.status)"
+          }
+          Write-Host ""
+
+          # ──────────────────────────────────────────────
+          # SRE Agent Summary Analysis
+          # ──────────────────────────────────────────────
+          $aiSummary = ""
+          if ("${{ parameters.includeAIAnalysis }}" -eq "true") {
+            Write-Host "Generating SRE Agent summary..." -ForegroundColor Yellow
+
+            $sreResult = Invoke-SREAgentAPI `
+              -Action "diagnostics" `
+              -Context @"
+            DEPLOYMENT HEALTH REPORT for Build $(Build.BuildNumber) to ${{ parameters.targetEnvironment }}
+
+            Pipeline stages:
+            $(($stageResults | ForEach-Object { "- $($_.name): $($_.result) ($($_.durationMinutes) min)" }) -join "`n")
+
+            Deployment metrics:
+            - Total duration: $($deploymentMetrics.totalDurationMinutes) min
+            - Passed stages: $($deploymentMetrics.passedStages)
+            - Failed stages: $($deploymentMetrics.failedStages)
+
+            Current resource health:
+            $(($healthStatus | ForEach-Object { "- $($_.resource): $($_.status)" }) -join "`n")
+
+            Provide a concise executive summary of this deployment:
+            1. Overall health assessment
+            2. Key risks or issues
+            3. Recommendations for next deployment
+            4. Trend observations (if any stages are consistently slow/failing)
+            "@ `
+              -Token $aiToken `
+              -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+              -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+              -SubscriptionId $subscriptionId `
+              -SREAgentName "${{ parameters.sreAgentName }}" `
+              -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+
+            if ($sreResult.success) {
+              $aiSummary = $sreResult.response
+              Write-Host $aiSummary
+            }
+          }
+
+          # ──────────────────────────────────────────────
+          # Generate Comprehensive Report
+          # ──────────────────────────────────────────────
+          $overallResult = if ($deploymentMetrics.failedStages -eq 0) { "SUCCESS" } else { "ISSUES DETECTED" }
+          $resultColor = if ($overallResult -eq "SUCCESS") { "Green" } else { "Red" }
+
+          Write-Host ""
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "   DEPLOYMENT: $overallResult" -ForegroundColor $resultColor
+          Write-Host "   Duration: $($deploymentMetrics.totalDurationMinutes) min" -ForegroundColor Cyan
+          Write-Host "   Stages: $($deploymentMetrics.passedStages)/$($deploymentMetrics.stageCount) passed" -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+
+          # Set output variables
+          Write-Host "##vso[task.setvariable variable=DeploymentResult;isOutput=true]$overallResult"
+          Write-Host "##vso[task.setvariable variable=PipelineDuration;isOutput=true]$($deploymentMetrics.totalDurationMinutes)"
+          Write-Host "##vso[task.setvariable variable=PassedStages;isOutput=true]$($deploymentMetrics.passedStages)"
+          Write-Host "##vso[task.setvariable variable=FailedStages;isOutput=true]$($deploymentMetrics.failedStages)"
+
+          # Write full report
+          $reportDir = "$(Build.ArtifactStagingDirectory)/sre-health-report"
+          New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
+
+          $reportPath = Join-Path $reportDir "deployment-health-${{ parameters.targetEnvironment }}-$(Build.BuildNumber).md"
+
+          $report = @"
+          # Deployment Health Report
+
+          **Build:** $(Build.BuildNumber)
+          **Branch:** $(Build.SourceBranch)
+          **Environment:** ${{ parameters.targetEnvironment }}
+          **Pipeline:** $(Build.DefinitionName)
+          **Requested By:** $(Build.RequestedFor)
+          **Date:** $(Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC")
+          **Result:** $overallResult
+
+          ---
+
+          ## Deployment Scorecard
+
+          | Metric | Value |
+          |--------|-------|
+          | Total Duration | $($deploymentMetrics.totalDurationMinutes) min |
+          | Stages Passed | $($deploymentMetrics.passedStages) / $($deploymentMetrics.stageCount) |
+          | Stages Failed | $($deploymentMetrics.failedStages) |
+          | Est. MTTD | $mttdMinutes min |
+          | Est. MTTR | $mttrMinutes min |
+
+          ## Pipeline Stages
+
+          | Stage | Result | Duration |
+          |-------|--------|----------|
+          $(($stageResults | ForEach-Object { "| $($_.name) | $($_.result) | $($_.durationMinutes) min |" }) -join "`n")
+
+          ## Environment Health
+
+          | Resource | Status |
+          |----------|--------|
+          $(($healthStatus | ForEach-Object { "| $($_.resource) | $($_.status) |" }) -join "`n")
+
+          ## SRE Agent Executive Summary
+
+          $aiSummary
+
+          ---
+          *Report generated by Azure SRE Agent integration pipeline*
+          "@
+
+          $report | Out-File -FilePath $reportPath -Encoding utf8
+
+          # Also generate JSON for tooling consumption
+          $jsonReport = @{
+              buildNumber = "$(Build.BuildNumber)"
+              environment = "${{ parameters.targetEnvironment }}"
+              result = $overallResult
+              metrics = $deploymentMetrics
+              stageResults = $stageResults
+              healthStatus = $healthStatus
+              aiSummary = $aiSummary
+              timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+          } | ConvertTo-Json -Depth 10
+
+          $jsonPath = Join-Path $reportDir "deployment-health-${{ parameters.targetEnvironment }}-$(Build.BuildNumber).json"
+          $jsonReport | Out-File -FilePath $jsonPath -Encoding utf8
+
+          # Upload to storage if configured
+          if ("${{ parameters.storageAccount }}") {
+            try {
+              az storage blob upload `
+                --account-name "${{ parameters.storageAccount }}" `
+                --container-name "${{ parameters.storageContainer }}" `
+                --name "${{ parameters.targetEnvironment }}/$(Build.BuildNumber)/health-report.md" `
+                --file $reportPath `
+                --overwrite `
+                --auth-mode login
+
+              az storage blob upload `
+                --account-name "${{ parameters.storageAccount }}" `
+                --container-name "${{ parameters.storageContainer }}" `
+                --name "${{ parameters.targetEnvironment }}/$(Build.BuildNumber)/health-report.json" `
+                --file $jsonPath `
+                --overwrite `
+                --auth-mode login
+
+              Write-Host "Reports uploaded to blob storage" -ForegroundColor Green
+            } catch {
+              Write-Host "Could not upload reports to blob storage: $_" -ForegroundColor Yellow
+            }
+          }
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Health Report'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/sre-health-report'
+        ArtifactName: 'SREHealthReport-${{ parameters.targetEnvironment }}'
+        publishLocation: 'Container'
+      continueOnError: true
