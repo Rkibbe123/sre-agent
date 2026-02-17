@@ -133,17 +133,17 @@ parameters:
     type: string
     default: 'https://rkibbe--88208374.4650bed8.eastus2.azuresre.ai'
   - name: sre_teams_webhook_url
-    displayName: 'Microsoft Teams Webhook URL for Incidents'
+    displayName: 'Microsoft Teams Webhook URL for Incidents (optional)'
     type: string
-    default: ''
+    default: ' '
   - name: sre_baseline_storage_account
     displayName: 'Storage Account for Performance Baselines'
     type: string
-    default: ''
+    default: 'ariinventorystorage'
   - name: sre_report_storage_account
     displayName: 'Storage Account for Health Reports'
     type: string
-    default: ''
+    default: 'ariinventorystorage'
   - name: sre_warmup_seconds
     displayName: 'Post-Deploy Warmup Wait (seconds)'
     type: number
